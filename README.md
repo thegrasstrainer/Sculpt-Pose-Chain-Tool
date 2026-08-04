@@ -1,3 +1,5 @@
+*Note: check side panel for updated version(s). This main page will download the initial v1.0.0 and I have updated this to a more usable version*
+
 # Sculpt-Pose-Chain-Tool
 A pose chain tool for Blender's sculpt mode so users can pose their meshes without leaving sculpt mode, or having to fight with the default pose brush.
 

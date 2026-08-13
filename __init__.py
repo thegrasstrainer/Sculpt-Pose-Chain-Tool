@@ -1,72 +1,23 @@
 # Add-on metadata lives in blender_manifest.toml next to this file.
-#
-# ARCHITECTURE NOTE (read this before touching the deformation code):
-# This tool places points in Sculpt Mode and treats them as an FK bone TREE
-# (not just a straight chain -- points can branch, e.g. a palm point with
-# several independent finger chains coming off it). Rather than hand-rolling
-# vertex skinning, it builds a real (hidden) Armature object with Automatic
-# Weights under the hood -- the same engine Blender uses for rigging -- and
-# then drives that armature's pose bones directly via Python (PoseBone.matrix)
-# from a custom modal operator running in Sculpt Mode. The user never sees
-# Pose Mode; dragging a point in the sculpt viewport is what moves the
-# underlying bone.
-#
-# SESSION MODEL: a single continuous modal operator (PCT_OT_activate) spans
-# the entire lifetime from "Activate" through to Clear/Apply. It never stops
-# and restarts in between. Its internal sub-state (props.state) moves
-# PLACING -> READY, and while READY, clicking near a point starts a drag
-# while clicks elsewhere pass through to the normal sculpt brush so sculpting
-# still works normally around it. The only way out is Clear Points / Apply
-# Deformations in the N-panel, which set state back to IDLE; the running
-# modal notices and exits on its next event.
-#
-# TREE / BRANCHING MODEL:
-#   Each point (except point 0, the anchor) stores parent_index -- the index
-#   of the point it branches off of. By default that's "the previous point",
-#   so a straight chain is just the simplest possible tree. To branch,
-#   clicking an EXISTING point during placement selects it as the new
-#   "active parent" -- subsequent new points attach there instead, letting
-#   you build e.g. one palm point with five independent finger chains.
-#
-#   Bone_Root is a small synthetic bone created at point 0 (the anchor) that
-#   every point with parent_index == 0 attaches to. This guarantees dragging
-#   the anchor moves the WHOLE tree uniformly, no matter how many branches
-#   start directly at it -- without it, each anchor-attached branch would be
-#   an independent root bone and we'd have to move them all separately.
-#   For every other point i (i >= 1): Bone_i goes from its parent point's
-#   current position to point i's position, parented under whichever bone
-#   ends at the parent point (Bone_Root if parent_index == 0, else
-#   Bone_{parent_index}).
-#
-# Dragging point 0 (anchor) translates Bone_Root -> the whole tree follows.
-# Dragging point i (i >= 1) rotates Bone_i around its head (the parent
-# point's position) -- and everything downstream (i's descendants in the
-# tree, which may span multiple branches) cascades automatically since those
-# bones are parented under it, directly or indirectly.
-
-'''Copyright (C) <2026> <the_grass_trainer>
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
-This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.'''
-
 
 import bpy
 import blf
 import gpu
 import math
+import heapq
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, Matrix
 from bpy_extras import view3d_utils
 from bpy.props import (
     FloatVectorProperty, CollectionProperty, IntProperty,
-    EnumProperty, PointerProperty, StringProperty, BoolProperty,
+    EnumProperty, PointerProperty, StringProperty, BoolProperty, FloatProperty,
 )
 from bpy.types import PropertyGroup, Operator, Panel
 
 # Set to True to print island detection, bone-binding, and branching
 # decisions to Blender's System Console (Window > Toggle System Console on
 # Windows; on Mac/Linux, launch Blender from a terminal to see stdout there).
-POSE_CHAIN_DEBUG = True
+POSE_CHAIN_DEBUG = False
 
 
 def dprint(*args):
@@ -86,6 +37,13 @@ class PCT_Point(PropertyGroup):
     parent_index: IntProperty(default=-1)
 
 
+class PCT_GroupNameEntry(PropertyGroup):
+    """Just tracks a vertex group name the tool created, so it can be
+    cleaned up again on Clear/Apply -- uses the .name field every
+    PropertyGroup already has, nothing else needed."""
+    pass
+
+
 class PCT_Properties(PropertyGroup):
     state: EnumProperty(
         items=[
@@ -99,7 +57,25 @@ class PCT_Properties(PropertyGroup):
     max_points: IntProperty(name="Max Points", default=3, min=2, max=100, soft_max=20,
                              description="Total points across the whole tree (including "
                                          "branches). Increase for longer/more branching rigs.")
+    weight_falloff: FloatProperty(
+        name="Weight Falloff", default=1.5, min=0.3, max=10.0,
+        description="How far each bone's influence reaches ALONG THE MESH SURFACE "
+                    "(not straight-line distance), as a multiple of that bone's own "
+                    "length. Lower values keep deformation tightly localized (good "
+                    "when a chain covers only part of a larger connected mesh, e.g. one "
+                    "leg of a full-body character) -- mesh outside this reach stays "
+                    "put instead of getting swept in by Automatic Weights.")
+    falloff_softness: FloatProperty(
+        name="Falloff Softness", default=0.5, min=0.0, max=0.95,
+        description="How much of each bone's reach is FULL strength before it starts "
+                    "fading, as a fraction of Weight Falloff. Separate from Weight "
+                    "Falloff itself: lowering THIS tightens how far a bone's motion "
+                    "blends back into its neighbor at a shared joint (e.g. a fingertip "
+                    "dragging in too much of the palm) without shrinking how far that "
+                    "bone reaches toward its own tip. Lower = tighter blend at joints, "
+                    "higher = softer/wider blend.")
     armature_obj: PointerProperty(type=bpy.types.Object)
+    created_vertex_groups: CollectionProperty(type=PCT_GroupNameEntry)
     modifier_name: StringProperty(default="")
     show_labels: BoolProperty(
         name="Show Point Numbers", default=True,
@@ -245,6 +221,20 @@ def get_descendants(idx, children_map):
     return result
 
 
+def capture_pose_snapshot(armature_obj):
+    """{bone_name: matrix_basis} for every pose bone. matrix_basis is each
+    bone's own local pose offset, independent of the parent chain, so it can
+    be captured/restored per-bone without needing to re-resolve hierarchy."""
+    return {b.name: b.matrix_basis.copy() for b in armature_obj.pose.bones}
+
+
+def restore_pose_snapshot(armature_obj, snapshot):
+    for name, mat in snapshot.items():
+        b = armature_obj.pose.bones.get(name)
+        if b is not None:
+            b.matrix_basis = mat.copy()
+
+
 def circle_verts_2d(cx, cy, radius, segments=16):
     verts = [(cx, cy)]
     for i in range(segments + 1):
@@ -364,6 +354,228 @@ def get_mesh_islands(mesh):
                     stack.append(nb)
         islands.append(island)
     return islands
+
+
+def build_mesh_adjacency(mesh, mesh_mat):
+    """[[(neighbor_index, edge_length_world), ...], ...] indexed by vertex
+    index, plus the world-space coordinate of every vertex."""
+    n = len(mesh.vertices)
+    coords = [mesh_mat @ v.co for v in mesh.vertices]
+    adjacency = [[] for _ in range(n)]
+    for e in mesh.edges:
+        a, b = e.vertices[0], e.vertices[1]
+        length = (coords[a] - coords[b]).length
+        adjacency[a].append((b, length))
+        adjacency[b].append((a, length))
+    return adjacency, coords
+
+
+def multi_source_geodesic_distances(adjacency, seeds):
+    """Dijkstra from multiple starting vertices at once. seeds is
+    {vertex_index: starting_distance} -- starting a seed at its own straight-
+    line distance to the bone (rather than 0) keeps the resulting numbers in
+    the same units/scale as a plain distance-to-bone measurement, just
+    corrected to follow the mesh surface past that point."""
+    dist = dict(seeds)
+    pq = [(d, v) for v, d in dist.items()]
+    heapq.heapify(pq)
+    while pq:
+        d, v = heapq.heappop(pq)
+        if d > dist.get(v, float('inf')):
+            continue
+        for nb, w in adjacency[v]:
+            nd = d + w
+            if nd < dist.get(nb, float('inf')):
+                dist[nb] = nd
+                heapq.heappush(pq, (nd, nb))
+    return dist
+
+
+def point_ancestor_chain(point_index, parent_indices):
+    """point_index plus every point above it on the path back to the anchor
+    (point 0). Used to tell whether two bones sit on the same branch (one is
+    an ancestor of the other) or are siblings on different branches."""
+    chain = {point_index}
+    cur = point_index
+    while cur != 0:
+        p = parent_indices[cur] if 0 <= cur < len(parent_indices) else -1
+        if p < 0:
+            break
+        chain.add(p)
+        cur = p
+    return chain
+
+
+def prune_distant_weights(mesh_obj, arm_obj, bone_names, falloff_multiplier, parent_indices,
+                           falloff_softness=0.5):
+    """Scale down each bone's weight influence smoothly with distance, fully
+    fading to zero by falloff_multiplier * that bone's own length -- AND
+    restrict each vertex to a single branch lineage, so sibling branches
+    (e.g. two separate legs that both start at the same hip point) never
+    blend weight into each other.
+
+    falloff_softness controls WHERE the fade-to-zero begins, as a fraction
+    of the reach (0 = starts fading immediately at the bone itself, 1 = full
+    strength almost all the way out then a very sharp final drop). This is
+    deliberately a SEPARATE knob from falloff_multiplier (the overall reach
+    distance): shrinking the overall reach weakens a bone's influence
+    everywhere, including out toward its own tip where it should usually
+    stay strong. Lowering softness instead tightens specifically how much
+    of a bone's own territory blends into its NEIGHBOR at a shared joint --
+    e.g. a child bone's influence creeping back into its parent's region
+    right around the point they share -- without touching how far that
+    bone reaches in its own direction.
+
+    Without the distance falloff: Automatic (heat-map) Weights normalizes
+    across whatever bones exist for the WHOLE connected mesh -- if a chain
+    only covers e.g. one leg of a full-body creature, every vertex still
+    gets bound to SOMETHING, including vertices on the far side of the body
+    that have no real relationship to that leg. The falloff scales weight
+    smoothly (full strength near the bone, gradually fading across the outer
+    half of the radius, zero beyond it) rather than a hard keep/discard
+    cutoff, which would create a visible rigid seam right at the threshold.
+
+    Without the lineage restriction: two sibling branches (e.g. both legs
+    attached to the same hip point) can each still reach back into that
+    SHARED region near the branch point, since their individual falloff
+    radii both cover it. A vertex there ends up with nonzero weight from
+    BOTH legs -- fine while they're posed the same, but as soon as they're
+    posed differently, that vertex tries to blend between two increasingly
+    divergent transforms, which is exactly what causes tearing/"candy
+    wrapper" artifacts in any linear blend skinning setup. The fix: for
+    each vertex, find whichever bone is geodesically closest (its
+    "primary" bone), then only bones that are ANCESTORS or DESCENDANTS of
+    that primary bone (i.e. further up or down the SAME branch) are allowed
+    to keep any influence -- smooth blending along one limb (e.g. a knee)
+    still works normally, but a completely different sibling branch is
+    zeroed out regardless of what its own distance falloff computed.
+
+    Distance is GEODESIC (measured along the mesh surface, not straight-line
+    3D distance) for the reasons described in point_segment_distance's
+    callers -- seeded from vertices already close to each bone by straight-
+    line distance, then walked outward edge-by-edge along the real surface.
+
+    This is run BEFORE fill_unweighted_vertices: any vertex/island that ends
+    up completely zero-weighted here still gets caught and handled by that
+    pass, so genuinely disconnected pieces still get bound to something.
+    Returns the number of (vertex, bone) influences that were adjusted.
+    """
+    mesh = mesh_obj.data
+    mesh_mat = mesh_obj.matrix_world
+    vgs = mesh_obj.vertex_groups
+    bone_vgs = {name: vgs.get(name) for name in bone_names}
+
+    adjacency, coords = build_mesh_adjacency(mesh, mesh_mat)
+
+    segments = {}
+    thresholds = {}
+    point_idx_of = {}  # bone name -> its point index (Bone_i -> i)
+    for name in bone_names:
+        pbone = arm_obj.pose.bones.get(name)
+        if pbone is None:
+            continue
+        head = arm_obj.matrix_world @ pbone.head
+        tail = arm_obj.matrix_world @ pbone.tail
+        segments[name] = (head, tail)
+        length = (tail - head).length
+        thresholds[name] = max(length * falloff_multiplier, 1e-4)
+        try:
+            point_idx_of[name] = int(name.split("_", 1)[1])
+        except ValueError:
+            continue
+
+    dprint(f"prune_distant_weights: falloff_multiplier={falloff_multiplier}, "
+           f"falloff_softness={falloff_softness}, "
+           f"thresholds={ {k: round(v, 4) for k, v in thresholds.items()} }")
+
+    # Seed the geodesic search from vertices already close to each bone by
+    # straight-line distance (a generous core, well inside the real
+    # threshold) -- from there, remaining distance is measured along the
+    # surface instead of through space.
+    CORE_RADIUS_FRACTION = 0.6
+    geodesic_by_bone = {}
+    for name, (head, tail) in segments.items():
+        core_r = thresholds[name] * CORE_RADIUS_FRACTION
+        seeds = {}
+        for i, p in enumerate(coords):
+            d = point_segment_distance(p, head, tail)
+            if d <= core_r:
+                seeds[i] = d
+        if not seeds:
+            best_i = min(range(len(coords)), key=lambda i: point_segment_distance(coords[i], head, tail))
+            seeds[best_i] = point_segment_distance(coords[best_i], head, tail)
+        dprint(f"  {name}: geodesic search seeded from {len(seeds)} nearby vertex(es) "
+               f"(core radius {core_r:.4f})")
+        geodesic_by_bone[name] = multi_source_geodesic_distances(adjacency, seeds)
+
+    # Precompute each bone's ancestor chain once (cheap, small) rather than
+    # recomputing it per vertex.
+    point_chains = {p: point_ancestor_chain(p, parent_indices) for p in point_idx_of.values()}
+
+    def same_lineage(a, b):
+        return a == b or a in point_chains.get(b, ()) or b in point_chains.get(a, ())
+
+    group_index_to_name = {vg.index: name for name, vg in bone_vgs.items() if vg}
+
+    # Full strength out to falloff_softness * threshold, then a smooth
+    # (smoothstep) fade down to zero by threshold.
+    full_strength_fraction = max(0.0, min(0.95, falloff_softness))
+
+    def falloff_factor(distance, threshold):
+        inner = threshold * full_strength_fraction
+        if distance <= inner:
+            return 1.0
+        if distance >= threshold:
+            return 0.0
+        t = (distance - inner) / (threshold - inner)
+        return 1.0 - (t * t * (3.0 - 2.0 * t))  # smoothstep, inverted (1 -> 0)
+
+    updates_by_group = {name: [] for name in bone_names}
+    removals_by_group = {name: [] for name in bone_names}
+
+    for v in mesh.vertices:
+        per_bone = {}  # point_idx -> (name, distance, falloff_weight)
+        for g in v.groups:
+            name = group_index_to_name.get(g.group)
+            if name is None or name not in segments:
+                continue
+            pt_idx = point_idx_of.get(name)
+            if pt_idx is None:
+                continue
+            gdist = geodesic_by_bone[name].get(v.index, float('inf'))
+            factor = falloff_factor(gdist, thresholds[name])
+            per_bone[pt_idx] = (name, gdist, g.weight * factor)
+
+        if not per_bone:
+            continue
+
+        primary_idx = min(per_bone, key=lambda k: per_bone[k][1])
+
+        for pt_idx, (name, dist, new_w) in per_bone.items():
+            final_w = new_w if same_lineage(pt_idx, primary_idx) else 0.0
+            if final_w <= 1e-6:
+                removals_by_group[name].append(v.index)
+            else:
+                updates_by_group[name].append((v.index, final_w))
+
+    adjusted = 0
+    for name in bone_names:
+        vg = bone_vgs.get(name)
+        if vg is None:
+            continue
+        if removals_by_group[name]:
+            vg.remove(removals_by_group[name])
+            adjusted += len(removals_by_group[name])
+        for idx, w in updates_by_group[name]:
+            vg.add([idx], w, 'REPLACE')
+        adjusted += len(updates_by_group[name])
+        if removals_by_group[name] or updates_by_group[name]:
+            dprint(f"  {name}: {len(updates_by_group[name])} scaled, "
+                   f"{len(removals_by_group[name])} zeroed "
+                   f"(threshold={thresholds[name]:.4f})")
+
+    dprint(f"prune_distant_weights: {adjusted} influence(s) adjusted total")
+    return adjusted
 
 
 def fill_unweighted_vertices(mesh_obj, arm_obj, bone_names):
@@ -539,6 +751,20 @@ def build_chain(context, mesh_obj):
             bpy.ops.object.parent_set(type='ARMATURE_ENVELOPE')
 
         bone_names = [f"Bone_{i}" for i in range(1, len(points_world))]
+
+        props.created_vertex_groups.clear()
+        for name in bone_names:
+            if mesh_obj.vertex_groups.get(name) is not None:
+                entry = props.created_vertex_groups.add()
+                entry.name = name
+
+        pruned = prune_distant_weights(mesh_obj, arm_obj, bone_names, props.weight_falloff,
+                                        parent_indices, props.falloff_softness)
+        if pruned:
+            print(f"Pose Chain Tool: smoothly scaled down {pruned} vertex influence(s) by "
+                  f"distance so far-away parts of the mesh fade out of this chain's "
+                  f"deformation instead of getting swept in.")
+
         fixed = fill_unweighted_vertices(mesh_obj, arm_obj, bone_names)
         if fixed:
             print(f"Pose Chain Tool: {fixed} vertex(es) had no weight from Automatic "
@@ -575,10 +801,10 @@ def build_chain(context, mesh_obj):
 
 
 def cleanup_chain(context, mesh_obj):
-    """Remove the temp rig and reset tool state. Does not touch mesh geometry --
-    call this AFTER modifier_apply if you want to keep the deformation, or
-    directly if you want to discard it (the modifier just loses its target and
-    stops deforming once the armature is gone)."""
+    """Remove the temp rig, its vertex groups, and reset tool state. Does not
+    touch mesh geometry -- call this AFTER modifier_apply if you want to keep
+    the deformation, or directly if you want to discard it (the modifier
+    just loses its target and stops deforming once the armature is gone)."""
     props = mesh_obj.pose_chain_tool
     arm_obj = props.armature_obj
     if arm_obj and arm_obj.name in bpy.data.objects:
@@ -591,6 +817,18 @@ def cleanup_chain(context, mesh_obj):
             mesh_obj.modifiers.remove(mesh_obj.modifiers[props.modifier_name])
         except Exception:
             pass
+    removed_groups = 0
+    for entry in props.created_vertex_groups:
+        vg = mesh_obj.vertex_groups.get(entry.name)
+        if vg is not None:
+            try:
+                mesh_obj.vertex_groups.remove(vg)
+                removed_groups += 1
+            except Exception:
+                pass
+    if removed_groups:
+        dprint(f"cleanup_chain: removed {removed_groups} temporary vertex group(s)")
+    props.created_vertex_groups.clear()
     props.points.clear()
     props.armature_obj = None
     props.modifier_name = ""
@@ -634,6 +872,16 @@ class PCT_OT_activate(Operator):
         self.drag_mode = None
         self.drag_bone = None
         self.drag_index = None
+        self.pose_undo_stack = []  # snapshots for our own in-tool pose undo
+
+        # Blender's native Ctrl+Z reloads scene data from a snapshot, which
+        # invalidates any Python object references a running script is still
+        # holding (self.obj, self.drag_bone, etc.) -- that's exactly the
+        # "StructRNA has been removed" crash. Disabling global undo for the
+        # session prevents that at the root; our own Ctrl+Z handling below
+        # provides pose undo instead, restored when the session ends.
+        self._prev_global_undo = context.preferences.edit.use_global_undo
+        context.preferences.edit.use_global_undo = False
 
         self._handle_view = bpy.types.SpaceView3D.draw_handler_add(
             self.draw_callback_view, (), 'WINDOW', 'POST_VIEW')
@@ -771,7 +1019,21 @@ class PCT_OT_activate(Operator):
                 return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
 
+        if event.type == 'Z' and (event.ctrl or event.oskey) and event.value == 'PRESS' and not self.dragging:
+            self.undo_pose(context, props)
+            return {'RUNNING_MODAL'}  # consume it -- never let this reach Blender's own undo
+
         return {'PASS_THROUGH'}
+
+    def undo_pose(self, context, props):
+        if not self.pose_undo_stack:
+            self.report({'INFO'}, "Nothing left to undo")
+            return
+        snapshot = self.pose_undo_stack.pop()
+        restore_pose_snapshot(props.armature_obj, snapshot)
+        context.view_layer.update()
+        dprint(f"undo_pose: restored snapshot, {len(self.pose_undo_stack)} more available")
+        self.report({'INFO'}, f"Pose change undone ({len(self.pose_undo_stack)} more available)")
 
     def pick_point(self, context, mouse, points_by_index):
         region, rv3d = context.region, context.region_data
@@ -790,6 +1052,11 @@ class PCT_OT_activate(Operator):
         self.drag_index = idx
         pbones = props.armature_obj.pose.bones
         region, rv3d = context.region, context.region_data
+
+        MAX_UNDO_STEPS = 50
+        self.pose_undo_stack.append(capture_pose_snapshot(props.armature_obj))
+        if len(self.pose_undo_stack) > MAX_UNDO_STEPS:
+            self.pose_undo_stack.pop(0)
 
         arm_scale = props.armature_obj.matrix_world.to_scale()
         mesh_scale = self.obj.matrix_world.to_scale()
@@ -875,6 +1142,11 @@ class PCT_OT_activate(Operator):
         if getattr(self, '_handle_pixel', None):
             bpy.types.SpaceView3D.draw_handler_remove(self._handle_pixel, 'WINDOW')
             self._handle_pixel = None
+        if hasattr(self, '_prev_global_undo'):
+            try:
+                context.preferences.edit.use_global_undo = self._prev_global_undo
+            except Exception:
+                pass
         if context.area:
             context.area.tag_redraw()
 
@@ -926,20 +1198,33 @@ class PCT_OT_activate(Operator):
         return {i: ready_color for i in points_by_index}
 
     def draw_callback_view(self):
-        points = self.current_points()
-        colors = self.marker_colors(points)
-        edges, edge_point_indices = self.current_edges(points)
-        edge_colors = [(colors.get(a, (1, 1, 1, 1)), colors.get(b, (1, 1, 1, 1)))
-                       for a, b in edge_point_indices]
-        draw_chain_edges_3d(edges, edge_colors)
+        # If Blender invalidated this operator instance (most commonly: the
+        # add-on file got hot-reloaded while this modal was still actively
+        # running), EVERY attribute access on self raises ReferenceError,
+        # including our own plain instance attributes -- there's no state we
+        # can reach to clean up the handler from inside a dead instance.
+        # Suppressing here just stops the console from flooding; the handler
+        # itself becomes a harmless permanent no-op until Blender restarts.
+        try:
+            points = self.current_points()
+            colors = self.marker_colors(points)
+            edges, edge_point_indices = self.current_edges(points)
+            edge_colors = [(colors.get(a, (1, 1, 1, 1)), colors.get(b, (1, 1, 1, 1)))
+                           for a, b in edge_point_indices]
+            draw_chain_edges_3d(edges, edge_colors)
+        except ReferenceError:
+            pass
 
     def draw_callback_pixel(self, context):
-        props = self.obj.pose_chain_tool
-        points = self.current_points()
-        colors = self.marker_colors(points)
-        highlight = self.active_parent_index if props.state == 'PLACING' else None
-        draw_chain_markers_2d(context, points, colors, show_labels=props.show_labels,
-                               highlight_index=highlight)
+        try:
+            props = self.obj.pose_chain_tool
+            points = self.current_points()
+            colors = self.marker_colors(points)
+            highlight = self.active_parent_index if props.state == 'PLACING' else None
+            draw_chain_markers_2d(context, points, colors, show_labels=props.show_labels,
+                                   highlight_index=highlight)
+        except ReferenceError:
+            pass
 
 
 class PCT_OT_cancel_placement(Operator):
@@ -1071,6 +1356,8 @@ class PCT_PT_panel(Panel):
             col.label(text="   the point it branches from.")
             col.label(text="   Click empty space to sculpt")
             col.label(text="   normally.")
+            col.label(text="   Ctrl+Z undoes the last pose")
+            col.label(text="   change (as many times as needed).")
             col.separator()
             col.label(text="4. Clear Points discards it all.")
             col.label(text="   Apply bakes the pose in.")
@@ -1080,6 +1367,8 @@ class PCT_PT_panel(Panel):
 
         if props.state == 'IDLE':
             layout.prop(props, "max_points")
+            layout.prop(props, "weight_falloff")
+            layout.prop(props, "falloff_softness")
             layout.operator("pct.activate", icon='PLAY', text="Activate")
 
         elif props.state == 'PLACING':
@@ -1095,6 +1384,7 @@ class PCT_PT_panel(Panel):
         else:  # READY -- chain built, points are live and clickable
             box = layout.box()
             box.label(text=f"Chain active — {len(props.points)} points", icon='CHECKMARK')
+            box.label(text="Ctrl+Z undoes the last pose change", icon='LOOP_BACK')
 
             layout.separator()
             row = layout.row(align=True)
@@ -1108,6 +1398,7 @@ class PCT_PT_panel(Panel):
 
 classes = (
     PCT_Point,
+    PCT_GroupNameEntry,
     PCT_Properties,
     PCT_OT_activate,
     PCT_OT_cancel_placement,

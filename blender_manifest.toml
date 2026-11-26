@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "sculpt_pose_chain_tool"
-version = "1.0.8"
+version = "1.5.2"
 name = "Sculpt Pose Chain Tool"
 tagline = "Place FK chain points in Sculpt Mode to pose the mesh"
 maintainer = "the_grass_trainer <https://github.com/thegrasstrainer/Sculpt-Pose-Chain-Tool>"

@@ -1,19 +1,49 @@
-*Note: check side panel for updated version(s). This main page will download the initial v1.0.0 and I have updated this to a more usable version*
-
 # Sculpt-Pose-Chain-Tool
 A pose chain tool for Blender's sculpt mode so users can pose their meshes without leaving sculpt mode, or having to fight with the default pose brush.
 
+**Current version: 1.5.2** · Requires Blender 4.3 or newer
 
 # Pose-able FK Chain in Sculpt Mode
-Do you ever wish that Blender's default Pose Brush tool had a bit more functionality to make posing your characters and creatures a better experience? Me too! With this N-Panel add-on you can add up to 100 points to deform your mesh without leaving Sculpt Mode!
+Do you ever wish that Blender's default Pose Brush tool had a bit more functionality to make posing your characters and creatures a better experience? Me too! With this N-Panel add-on you can place up to 17 points to deform your mesh without leaving Sculpt Mode!
 
-## Includes 3 Color Coded Visuals to inform you of which step in the process you're in:
+## Installation
+1. Download the latest release zip from the Releases section on the right side of this page.
+2. In Blender, go to **Edit > Preferences > Get Extensions**, open the dropdown in the top-right corner, and choose **Install from Disk...**
+3. Select the zip. In Sculpt Mode, press **N** and open the **Pose Chain** tab.
 
-__Red:__ When you click the Activate button you can place up to 100 red points (20 by default; click this field and type any number up to 100 to increase the count)! Also by default these will be numbered in the order you place them (there's a toggle in the N-Panel), click any previously added point to select it and begin adding other branches of "child points" like with trees, or fingers on a hand!
+## How to Use
+1. Set **Max Points** (3 by default, up to 17 total including branches), then click **Activate**.
+2. Click on the mesh to place points. Click any previously placed point to branch new "child points" off of it, like with trees or fingers on a hand!
+   - **Backspace** or **Ctrl+Z**: undo the last point
+   - **Enter**: finish placing and build the chain
+   - **Esc**: cancel
+3. Pose the mesh:
+   - Drag the first point (the anchor) to move the whole tree.
+   - Drag any other point to rotate it and everything branching off of it.
+   - Click empty space to keep sculpting.
+   - **Ctrl+Z** undoes a pose change.
+4. Click **Apply** to bake the pose into the mesh, or **Clear Points** to throw it away and restore the original mesh.
 
-__Blue:__ After hitting Enter you can now enter Pose Mode of the tool.
+## 3 Color Coded Visuals tell you which step you're in
 
-__Green:__ When you left mouse click a Blue point and drag that point and its children will turn green to inform you of everything currently being affected.
+__Orange-red:__ Placement mode. Points are numbered in the order you place them (toggle with **Show Point Numbers**).
+
+__Blue:__ The chain is built and ready to pose.
+
+__Green:__ While you drag a point, it and all of its children turn green so you can see everything currently being affected.
+
+## Weighting Controls
+These are available before you activate, and they update the mesh live while a chain is active:
+
+- **Weight Falloff**: how wide each bone's influence reaches. Raise it for thicker limbs; lower it if a bone is pulling on a neighboring area.
+- **Falloff Softness**: how gradually weight fades near joints and bone tips. Low values can leave dead zones; higher values smooth things out.
+- **Joint Blend**: how much each bone shares weight with its parent and children. 0 keeps every section fully independent; 1 blends joints smoothly.
+
+## Preview Bone Influence
+While a chain is active, pick a point from the dropdown and click **Preview Bone Influence**. This switches to Weight Paint mode so you can see exactly which part of the mesh that bone moves and how strongly. Switch back to Sculpt Mode from the mode dropdown in the top-left of the viewport when you're done.
+
+## Troubleshooting
+Turn on **Debug Logging** to print detailed weighting info to Blender's System Console (**Window > Toggle System Console** on Windows). It's off by default for performance.
 
 ## Apply or Cancel the Tool!
-After placing the red points, and hitting Enter you're inside of the pose mode of this add-on. From here you can decide to apply the deformations you have made, or hit cancel to revert back to the original mesh before you started adding the points. It's pretty easy to test it, and then not even need to commit to your changes in case you need to change something before continuing the sculpt.
+Nothing is permanent until you hit Apply. It's pretty easy to test a pose, and then not even need to commit to your changes in case you need to change something before continuing the sculpt.

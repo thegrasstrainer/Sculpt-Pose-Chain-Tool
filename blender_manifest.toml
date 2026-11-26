@@ -9,3 +9,13 @@ type = "add-on"
 tags = ["Sculpt"]
 blender_version_min = "4.3.0"
 license = ["SPDX:GPL-3.0-or-later"]
+
+[build]
+# Keep repo-only files out of the extension zip.
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  ".*",
+  "/dist/",
+  "/CLAUDE.md",
+]

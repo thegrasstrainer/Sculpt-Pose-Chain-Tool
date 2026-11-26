@@ -65,6 +65,11 @@ _geodesic_cache = {}
 # when it finally fires, so nothing is lost by coalescing like this.
 _refresh_pending = set()
 
+# Mesh object names currently being dragged in Object Mode (Fast Dragging).
+# The N-panel normally only shows in Sculpt Mode; its poll() checks this so
+# the panel doesn't vanish and reappear on every drag.
+_object_mode_drag = set()
+
 
 def _schedule_corridor_refresh(obj_name):
     """Debounced live-update: re-run apply_uniform_falloff_weights shortly
@@ -236,6 +241,11 @@ class PCT_Properties(PropertyGroup):
     show_help: BoolProperty(
         name="Show Help", default=True,
         description="Show the how-to-use instructions in this panel")
+    fast_drag: BoolProperty(
+        name="Fast Dragging", default=True,
+        description="Switch to Object Mode while dragging a point and back to "
+                    "Sculpt Mode when you let go. Much smoother on dense "
+                    "meshes: Sculpt Mode makes every pose update far slower")
     debug_logging: BoolProperty(
         name="Debug Logging", default=False,
         update=_update_debug_logging,
@@ -474,62 +484,61 @@ def draw_chain_markers_2d(context, points_by_index, colors_by_index, show_labels
     gpu.state.blend_set('NONE')
 
 
-def point_segment_distance(p, a, b):
-    """Distance from point p to the line segment a-b (all Vectors, same space)."""
-    ab = b - a
-    ab_len_sq = ab.length_squared
-    if ab_len_sq <= 1e-12:
-        return (p - a).length
-    t = max(0.0, min(1.0, (p - a).dot(ab) / ab_len_sq))
-    return (p - (a + ab * t)).length
+def connected_component_labels(n, edge_a, edge_b):
+    """Connected components of a graph with n vertices and the given edges
+    (two equal-length numpy int arrays). Returns a numpy int array where
+    labels[v] is the smallest vertex index in v's component.
+
+    Pure numpy (scipy isn't part of Blender's bundled Python, only numpy):
+    a parallel union-find. Each round, every component root hooks onto the
+    smallest root it shares an edge with, then pointer-jumping flattens
+    the trees. Edges whose ends are already in the same component are
+    dropped as it goes, so later rounds only touch edges that still matter.
+    Replaces a per-vertex Python BFS (benchmarked ~1.5 s at 1M vertices)."""
+    import numpy as np
+    parent = np.arange(n, dtype=np.int64)
+    a = np.asarray(edge_a, dtype=np.int64)
+    b = np.asarray(edge_b, dtype=np.int64)
+    while True:
+        while True:
+            grand = parent[parent]
+            if np.array_equal(grand, parent):
+                break
+            parent = grand
+        ra = parent[a]
+        rb = parent[b]
+        spanning = ra != rb
+        if not spanning.any():
+            return parent
+        a = a[spanning]
+        b = b[spanning]
+        ra = ra[spanning]
+        rb = rb[spanning]
+        # Hook the larger root under the smaller one. Both are roots, and
+        # lo < hi always, so this can never create a cycle.
+        np.minimum.at(parent, np.maximum(ra, rb), np.minimum(ra, rb))
 
 
-def get_mesh_islands(adjacency):
-    """Connected components by vertex/edge adjacency   each disconnected
-    piece (e.g. a separate object before it was Ctrl+J joined into this
-    one) comes back as its own list of vertex indices. Takes a PRE-BUILT
-    adjacency list (see build_mesh_adjacency) rather than rebuilding one
-    from mesh.edges   this is called both once per chain build AND (for
-    debug logging) on every drag start, so re-scanning every edge on a
-    large mesh each time was real, avoidable, repeated cost.
-
-    Plain Python BFS/stack traversal   NOT scipy, despite scipy's
-    connected_components being a natural fit here: confirmed scipy isn't
-    part of Blender's bundled Python (only numpy is), so depending on it
-    breaks the add-on outright rather than just being slower."""
-    n = len(adjacency)
-    visited = [False] * n
-    islands = []
-    for start in range(n):
-        if visited[start]:
-            continue
-        visited[start] = True
-        stack = [start]
-        island = []
-        while stack:
-            vi = stack.pop()
-            island.append(vi)
-            for nb, _length in adjacency[vi]:
-                if not visited[nb]:
-                    visited[nb] = True
-                    stack.append(nb)
-        islands.append(island)
-    return islands
+def get_mesh_islands(n_verts, edges):
+    """Each disconnected mesh piece (e.g. separate objects Ctrl+J joined
+    into this one) as its own numpy array of vertex indices. edges is the
+    (edge_a, edge_b) pair from build_mesh_adjacency."""
+    import numpy as np
+    labels = connected_component_labels(n_verts, edges[0], edges[1])
+    order = np.argsort(labels, kind='stable')
+    _unique, starts = np.unique(labels[order], return_index=True)
+    return np.split(order, starts[1:])
 
 
 def build_mesh_adjacency(mesh, mesh_mat):
-    """[[(neighbor_index, edge_length_world), ...], ...] indexed by vertex
-    index, plus a numpy (V,3) array of world-space vertex coordinates.
+    """Mesh connectivity as a pair of numpy int arrays (edge_a, edge_b),
+    one entry per edge, plus a numpy (V,3) array of world-space vertex
+    coordinates.
 
-    Uses foreach_get (Blender's bulk C-level array extraction) and
-    vectorized numpy math for the coordinate transform and every edge
-    length, instead of one Vector multiply/subtraction per vertex/edge in
-    a Python loop   confirmed faster at the scale this tool now needs to
-    handle (large meshes, many bones). The only remaining Python loop
-    here is building the adjacency list itself (a ragged, variable-length
-    structure that doesn't vectorize the same way), and even that loop's
-    per-iteration work is now just two list appends of pre-computed
-    values, not a vector subtraction each time."""
+    Everything here is bulk foreach_get + numpy. It used to also build a
+    Python list-of-lists adjacency (one Python append per edge end, ~2.5 s
+    at 1M vertices); nothing needs that anymore now that island detection
+    works directly on the edge arrays."""
     import numpy as np
     n = len(mesh.vertices)
     m = len(mesh.edges)
@@ -541,53 +550,29 @@ def build_mesh_adjacency(mesh, mesh_mat):
     homog = np.hstack([local_co, np.ones((n, 1))])
     world_co = (homog @ mat.T)[:, :3]
 
-    adjacency = [[] for _ in range(n)]
+    flat_edges = np.empty(m * 2, dtype=np.int64)
     if m > 0:
-        flat_edges = np.empty(m * 2, dtype=np.int64)
         mesh.edges.foreach_get('vertices', flat_edges)
-        edge_verts = flat_edges.reshape(m, 2)
-        lengths = np.linalg.norm(world_co[edge_verts[:, 0]] - world_co[edge_verts[:, 1]], axis=1)
-
-        edge_a = edge_verts[:, 0].tolist()
-        edge_b = edge_verts[:, 1].tolist()
-        lengths_list = lengths.tolist()
-        for i in range(m):
-            a, b, length = edge_a[i], edge_b[i], lengths_list[i]
-            adjacency[a].append((b, length))
-            adjacency[b].append((a, length))
-
-    return adjacency, world_co
-
-
-def _directional_overshoot_factor(d, path_length, band):
-    """Smoothly damps toward 0 as d exceeds path_length by up to `band`,
-    instead of a hard binary cutoff   used to soften the "past this
-    point" check so a vertex just barely past an endpoint fades out
-    gradually rather than getting hard-rejected right at an abrupt wall.
-    d <= path_length always returns full strength (1.0)."""
-    if d <= path_length:
-        return 1.0
-    over = d - path_length
-    if band <= 0 or over >= band:
-        return 0.0
-    t = over / band
-    return 1.0 - (t * t * (3.0 - 2.0 * t))
+    edge_verts = flat_edges.reshape(m, 2)
+    edges = (edge_verts[:, 0].copy(), edge_verts[:, 1].copy())
+    return edges, world_co
 
 
 def compute_bone_positions(mesh_obj, arm_obj, bone_names):
     """Lightweight replacement for the old Dijkstra-based geodesic search:
     just extracts each bone's head/tail world positions and path_length,
     plus the mesh's own world-space vertex coordinates (as a numpy array)
-    and edge adjacency (kept only for clean_up_weight_islands' island
+    and edge connectivity (kept only for clean_up_weight_islands' island
     detection   the weighting itself below no longer needs it at all).
     No graph search happens here.
 
-    Returns {"coords_np": numpy (V,3) array, "adjacency": [...], "bones":
-    {name: {"path_length", "head_pos", "tail_pos", "thickness"}, ...}}.
+    Returns {"coords_np": numpy (V,3) array, "edges": (edge_a, edge_b)
+    numpy arrays, "bones": {name: {"path_length", "head_pos", "tail_pos",
+    "thickness", "tip_thickness"}, ...}}.
     """
     mesh = mesh_obj.data
     mesh_mat = mesh_obj.matrix_world
-    adjacency, coords_np = build_mesh_adjacency(mesh, mesh_mat)
+    edges, coords_np = build_mesh_adjacency(mesh, mesh_mat)
 
     bones = {}
     for name in bone_names:
@@ -602,7 +587,7 @@ def compute_bone_positions(mesh_obj, arm_obj, bone_names):
                        "tip_thickness": estimate_tip_thickness(mesh_obj, head, tail)}
         dprint(f"  {name}: measured limb radius={bones[name]['thickness']:.4f}, "
                f"radius at tail={bones[name]['tip_thickness']:.4f}")
-    return {"coords_np": coords_np, "adjacency": adjacency, "bones": bones}
+    return {"coords_np": coords_np, "edges": edges, "bones": bones}
 
 
 def _median_ray_distance(mesh_obj, origins_and_dirs):
@@ -924,20 +909,21 @@ def clean_up_weight_islands(mesh_obj, bone_names, positions, valid_by_bone, weig
     calculation). valid_by_bone/weight_by_bone are {bone_name: numpy
     array} from apply_uniform_falloff_weights, reused directly here
     rather than rediscovered by scanning every vertex's groups again.
-    Island detection is plain Python BFS   NOT scipy's connected_components,
-    despite that being a natural fit: confirmed scipy isn't part of
-    Blender's bundled Python (only numpy is), so depending on it broke the
-    add-on outright rather than just being slower.
+    Island detection and reassignment are pure numpy (see
+    connected_component_labels)   scipy isn't part of Blender's bundled
+    Python, only numpy is. This used to be a per-vertex Python BFS plus a
+    per-vertex mathutils loop for reassignment (benchmarked ~0.9-1.7 s at
+    1M vertices, on every slider change).
 
     Returns the number of vertices that had weight removed or reassigned.
     """
     import numpy as np
-    from mathutils import Vector
 
     vgs = mesh_obj.vertex_groups
     coords_np = positions["coords_np"]
     bone_positions = positions["bones"]
-    adjacency = positions["adjacency"]
+    edge_a, edge_b = positions["edges"]
+    n_verts = coords_np.shape[0]
     removed_total = 0
     dprint(f"clean_up_weight_islands: min_island_fraction={min_island_fraction}")
 
@@ -952,45 +938,54 @@ def clean_up_weight_islands(mesh_obj, bone_names, positions, valid_by_bone, weig
     bone_order = [n for n in bone_names if n in weight_by_bone]
     weight_stack = np.stack([weight_by_bone[n] for n in bone_order]) if bone_order else None
 
-    # Reassignment target vertex groups, built once and reused/created as
-    # needed rather than per-vertex, and applied all at once at the end so
-    # a vertex being reassigned OUT of one bone in this same pass doesn't
-    # interfere with another bone's island detection still in progress.
-    reassignments = []  # (vertex_index, target_bone_name, weight)
+    # Per-bone segment data for reassignment, in bone_positions order (the
+    # order the old per-vertex search walked them in, so ties resolve the
+    # same way: first bone at the minimum distance wins).
+    seg_names = list(bone_positions.keys())
+    seg_head = np.array([tuple(bone_positions[n]["head_pos"]) for n in seg_names],
+                        dtype=np.float64).reshape(-1, 3)
+    seg_tail = np.array([tuple(bone_positions[n]["tail_pos"]) for n in seg_names],
+                        dtype=np.float64).reshape(-1, 3)
+    seg_len = np.array([bone_positions[n]["path_length"] for n in seg_names],
+                       dtype=np.float64)
 
-    def best_reassignment(vi, exclude_name):
-        vertex_pos = coords_np[vi]
-        best_name = None
-        best_dist = None
-        best_weight = 0.0
-        for other_name, bdata in bone_positions.items():
-            if other_name == exclude_name:
-                continue
-            head = bdata["head_pos"]
-            tail = bdata["tail_pos"]
-            path_length = bdata["path_length"]
-            ab = tail - head
-            ab_len_sq = ab.length_squared
-            if ab_len_sq < 1e-12:
-                ab_len_sq = 1e-12
-            vp = Vector((float(vertex_pos[0]), float(vertex_pos[1]), float(vertex_pos[2])))
-            t_raw = (vp - head).dot(ab) / ab_len_sq
-            t_clamped = max(0.0, min(1.0, t_raw))
-            closest = head + ab * t_clamped
-            dist = (vp - closest).length
-            if best_dist is None or dist < best_dist:
-                band = max(path_length * falloff_softness, 1e-6)
-                overshoot = 0.0
-                if t_raw < 0.0:
-                    overshoot = -t_raw * path_length
-                elif t_raw > 1.0:
-                    overshoot = (t_raw - 1.0) * path_length
-                dir_factor = _directional_overshoot_factor(overshoot, 0.0, band)
-                weight = t_clamped * t_clamped * (3.0 - 2.0 * t_clamped) * dir_factor
-                best_dist = dist
-                best_name = other_name
-                best_weight = weight
-        return best_name, best_weight
+    def best_reassignment(vert_idx, exclude_name):
+        """For each vertex in vert_idx: the closest OTHER bone (straight-line
+        distance to its segment) and that bone's falloff weight there.
+        Returns (target_seg_index array, weight array); index -1 = none."""
+        cand = [i for i, n in enumerate(seg_names) if n != exclude_name]
+        k = len(vert_idx)
+        if not cand or k == 0:
+            return np.full(k, -1, dtype=np.int64), np.zeros(k)
+        cand = np.array(cand, dtype=np.int64)
+        p = coords_np[vert_idx]                                   # (k, 3)
+        head = seg_head[cand]                                     # (c, 3)
+        ab = seg_tail[cand] - head                                # (c, 3)
+        ab_len_sq = np.maximum(np.einsum('ij,ij->i', ab, ab), 1e-12)
+        rel = p[None, :, :] - head[:, None, :]                    # (c, k, 3)
+        t_raw = np.einsum('ckj,cj->ck', rel, ab) / ab_len_sq[:, None]
+        t_cl = np.clip(t_raw, 0.0, 1.0)
+        closest = head[:, None, :] + t_cl[:, :, None] * ab[:, None, :]
+        dist = np.linalg.norm(p[None, :, :] - closest, axis=2)    # (c, k)
+        best = np.argmin(dist, axis=0)                            # (k,)
+        cols = np.arange(k)
+        t_raw_b = t_raw[best, cols]
+        t_cl_b = t_cl[best, cols]
+        path_len = seg_len[cand][best]
+        band = np.maximum(path_len * falloff_softness, 1e-6)
+        overshoot = np.where(t_raw_b < 0.0, -t_raw_b * path_len,
+                             np.where(t_raw_b > 1.0, (t_raw_b - 1.0) * path_len, 0.0))
+        tt = np.clip(overshoot / band, 0.0, 1.0)
+        dir_factor = np.where(overshoot <= 0.0, 1.0, 1.0 - tt * tt * (3.0 - 2.0 * tt))
+        weight = t_cl_b * t_cl_b * (3.0 - 2.0 * t_cl_b) * dir_factor
+        return cand[best], weight
+
+    # Reassignments are collected and applied all at once at the end so a
+    # vertex being reassigned OUT of one bone in this same pass doesn't
+    # interfere with another bone's island detection still in progress.
+    reassign_verts = []    # list of numpy arrays, in the order found
+    reassign_target = []   # matching arrays of seg_names indices
+    reassign_weight = []   # matching arrays of weights
 
     for name in bone_names:
         vg = vgs.get(name)
@@ -1000,100 +995,90 @@ def clean_up_weight_islands(mesh_obj, bone_names, positions, valid_by_bone, weig
         if valid_mask is None or not valid_mask.any():
             continue
 
-        weighted = set(valid_mask.nonzero()[0].tolist())
-        if not weighted:
+        weighted_idx = np.nonzero(valid_mask)[0]
+        # Islands = connected components of the subgraph made of this
+        # bone's weighted vertices and the mesh edges between them,
+        # computed on a compacted index space (only weighted vertices).
+        keep = valid_mask[edge_a] & valid_mask[edge_b]
+        remap = np.full(n_verts, -1, dtype=np.int64)
+        remap[weighted_idx] = np.arange(len(weighted_idx))
+        labels = connected_component_labels(len(weighted_idx),
+                                            remap[edge_a[keep]], remap[edge_b[keep]])
+        _roots, inverse, counts = np.unique(labels, return_inverse=True,
+                                            return_counts=True)
+        if len(counts) <= 1:
+            continue
+
+        largest_size = int(counts.max())
+        min_size = max(1, int(largest_size * min_island_fraction))
+        island_size_of_vert = counts[inverse]
+        small_verts = weighted_idx[island_size_of_vert < min_size]
+        dprint(f"  {name}: {len(counts)} island(s), "
+               f"sizes={sorted(counts.tolist(), reverse=True)[:20]}, "
+               f"min_size={min_size} (largest * {min_island_fraction})")
+        if len(small_verts) == 0:
             continue
 
         if weight_stack is not None and name in bone_order and weight_stack.shape[0] > 1:
             idx = bone_order.index(name)
-            other_max = np.max(np.delete(weight_stack, idx, axis=0), axis=0)
+            other_max = np.max(np.delete(weight_stack[:, small_verts], idx, axis=0), axis=0)
+            safe = small_verts[other_max >= FALLBACK_WEIGHT_THRESHOLD]
+            to_reassign = small_verts[other_max < FALLBACK_WEIGHT_THRESHOLD]
         else:
-            other_max = None
+            safe = small_verts
+            to_reassign = small_verts[:0]
 
-        visited = set()
-        islands = []
-        for start in weighted:
-            if start in visited:
-                continue
-            island = set()
-            queue = [start]
-            visited.add(start)
-            while queue:
-                cur = queue.pop()
-                island.add(cur)
-                for neighbor_i, _edge_len in adjacency[cur]:
-                    if neighbor_i in weighted and neighbor_i not in visited:
-                        visited.add(neighbor_i)
-                        queue.append(neighbor_i)
-            islands.append(island)
+        to_remove = [safe]
+        if len(to_reassign):
+            target_idx, target_weight = best_reassignment(to_reassign, name)
+            ok = (target_idx >= 0) & (target_weight > 1e-6)
+            if ok.any():
+                reassign_verts.append(to_reassign[ok])
+                reassign_target.append(target_idx[ok])
+                reassign_weight.append(target_weight[ok])
+                to_remove.append(to_reassign[ok])
+            dprint(f"  {name}: reassigning {int(ok.sum())} vertex(es) that would "
+                   f"otherwise be orphaned to whichever other bone is spatially closest.")
 
-        if len(islands) <= 1:
-            continue
-
-        largest = max(islands, key=len)
-        min_size = max(1, int(len(largest) * min_island_fraction))
-        to_remove = []
-        removed_island_count = 0
-        reassigned_island_count = 0
-        island_sizes = sorted((len(isl) for isl in islands), reverse=True)
-        dprint(f"  {name}: {len(islands)} island(s), sizes={island_sizes}, "
-               f"min_size={min_size} (largest * {min_island_fraction})")
-        for island in islands:
-            if island is largest:
-                continue
-            if len(island) < min_size:
-                if other_max is not None:
-                    island_list = list(island)
-                    island_other_max = [other_max[v] for v in island_list]
-                    safe = [v for v, w in zip(island_list, island_other_max)
-                            if w >= FALLBACK_WEIGHT_THRESHOLD]
-                    to_reassign = [v for v, w in zip(island_list, island_other_max)
-                                   if w < FALLBACK_WEIGHT_THRESHOLD]
-                    if len(island) > 1:
-                        dprint(f"    fallback weight in this island: "
-                               f"min={min(island_other_max):.4f}, "
-                               f"max={max(island_other_max):.4f}, "
-                               f"mean={sum(island_other_max)/len(island_other_max):.4f}")
-                else:
-                    safe = list(island)
-                    to_reassign = []
-                if safe:
-                    to_remove.extend(safe)
-                    removed_island_count += 1
-                if to_reassign:
-                    for vi in to_reassign:
-                        target_name, target_weight = best_reassignment(vi, name)
-                        if target_name is not None and target_weight > 1e-6:
-                            reassignments.append((vi, target_name, target_weight))
-                            to_remove.append(vi)
-                    reassigned_island_count += 1
-                    dprint(f"  {name}: reassigning {len(to_reassign)} vertex(es) that "
-                           f"would otherwise be orphaned   no other bone gave them "
-                           f"meaningful weight, so each is handed to whichever bone is "
-                           f"spatially closest instead of being left at zero weight.")
-
-        if to_remove:
-            vg.remove(to_remove)
+        to_remove = np.concatenate(to_remove)
+        if len(to_remove):
+            vg.remove(to_remove.tolist())
             removed_total += len(to_remove)
-            dprint(f"  {name}: removed/reassigned {len(to_remove)} vertex(es) across "
-                   f"{removed_island_count} deleted + {reassigned_island_count} "
-                   f"reassigned isolated island(s) (largest region kept: "
-                   f"{len(largest)} vertices)")
+            dprint(f"  {name}: removed/reassigned {len(to_remove)} vertex(es) "
+                   f"(largest region kept: {largest_size} vertices)")
 
-    # Apply all reassignments in one pass at the end.
-    by_target = {}
-    for vi, target_name, weight in reassignments:
-        by_target.setdefault(target_name, []).append((vi, weight))
-    for target_name, entries in by_target.items():
-        vg = vgs.get(target_name)
-        if vg is None:
-            continue
-        for vi, weight in entries:
-            vg.add([vi], weight, 'REPLACE')
+    # Apply all reassignments in one pass at the end. 'REPLACE' means that
+    # if the same vertex was reassigned to the same bone more than once,
+    # the LAST assignment wins   keep only that one, then batch vg.add()
+    # calls by identical weight value.
+    n_reassigned = 0
+    if reassign_verts:
+        all_v = np.concatenate(reassign_verts)
+        all_t = np.concatenate(reassign_target)
+        all_w = np.concatenate(reassign_weight)
+        for ti in np.unique(all_t):
+            vg = vgs.get(seg_names[ti])
+            if vg is None:
+                continue
+            sel = all_t == ti
+            v = all_v[sel]
+            w = all_w[sel]
+            rev_unique, rev_first = np.unique(v[::-1], return_index=True)
+            last = len(v) - 1 - rev_first
+            v = v[last]
+            w = w[last]
+            n_reassigned += len(v)
+            order = np.argsort(w, kind='stable')
+            v = v[order]
+            w = w[order]
+            uw, starts = np.unique(w, return_index=True)
+            starts = np.append(starts, len(w))
+            for gi in range(len(uw)):
+                vg.add(v[starts[gi]:starts[gi + 1]].tolist(), float(uw[gi]), 'REPLACE')
 
     if removed_total:
         dprint(f"clean_up_weight_islands: {removed_total} vertex(es) cleaned up total "
-               f"({len(reassignments)} reassigned, {removed_total - len(reassignments)} deleted)")
+               f"({n_reassigned} reassigned)")
     return removed_total
 
 
@@ -1342,6 +1327,14 @@ class PCT_OT_activate(Operator):
         # over other regions like the N-panel   so checking context.region.type
         # here never actually detects an N-panel click. Instead, check the
         # mouse's real screen position against the viewport's own rectangle.
+        #
+        # Exception: a drag must always end on mouse release, even if the
+        # mouse was released over the N-panel or another editor   otherwise
+        # the drag (and Fast Dragging's Object Mode) would get stuck on.
+        if (self.dragging and event.type == 'LEFTMOUSE'
+                and event.value == 'RELEASE'):
+            self.end_drag(context)
+            return {'RUNNING_MODAL'}
         if not mouse_in_viewport_window(context, event):
             return {'PASS_THROUGH'}
 
@@ -1455,11 +1448,7 @@ class PCT_OT_activate(Operator):
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if self.dragging:
-                self.dragging = False
-                if self.drag_bone is not None:
-                    m = self.drag_bone.matrix
-                    dprint(f"end_drag: bone={self.drag_bone.name} "
-                           f"final head(armature-space)={tuple(round(c, 4) for c in m.translation)}")
+                self.end_drag(context)
                 return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
 
@@ -1544,13 +1533,19 @@ class PCT_OT_activate(Operator):
                     if bound_verts:
                         cached = _geodesic_cache.get(self.obj.name)
                         if cached is not None:
-                            islands = get_mesh_islands(cached["adjacency"])
-                            bound_set = set(bound_verts)
+                            import numpy as np
+                            n = len(mesh.vertices)
+                            islands = get_mesh_islands(n, cached["edges"])
+                            bound = np.zeros(n, dtype=bool)
+                            bound[bound_verts] = True
                             for i_idx, island in enumerate(islands):
-                                overlap = bound_set.intersection(island)
+                                overlap = int(bound[island].sum())
                                 if overlap:
                                     dprint(f"    -> island {i_idx} ({len(island)} verts total): "
-                                           f"{len(overlap)} of them bound here")
+                                           f"{overlap} of them bound here")
+
+        # Last, after all drag state above is captured from Sculpt Mode.
+        self.enter_fast_drag_mode(context, props)
 
     def update_drag(self, context, mouse, props):
         arm_obj = props.armature_obj
@@ -1575,14 +1570,64 @@ class PCT_OT_activate(Operator):
                 rot = Matrix.Rotation(delta_angle, 4, self.drag_view_axis)
                 new_world = Matrix.Translation(pivot) @ rot @ Matrix.Translation(-pivot) @ start_world
 
+            # No context.view_layer.update() here: setting the matrix already
+            # tags the rig for re-evaluation, and Blender evaluates it once
+            # before the next viewport redraw. Forcing it on every mouse-move
+            # event re-deformed the whole mesh per event (~60 ms each at 700k
+            # vertices), even when several events arrive between redraws.
             self.drag_bone.matrix = arm_world_inv @ new_world
-            context.view_layer.update()
         except Exception as e:
             print(f"Pose Chain Tool: drag update failed: {e}")
+
+    def end_drag(self, context):
+        self.dragging = False
+        if self.drag_bone is not None:
+            m = self.drag_bone.matrix
+            dprint(f"end_drag: bone={self.drag_bone.name} "
+                   f"final head(armature-space)={tuple(round(c, 4) for c in m.translation)}")
+        self.leave_fast_drag_mode(context)
+
+    #   Fast Dragging: Object Mode while a point is dragged      -
+    #
+    # Benchmarked on a 714k-vertex sculpt: after each pose change, Blender
+    # re-evaluates the mesh in ~70 ms in Sculpt Mode but ~4 ms in Object
+    # Mode (Sculpt Mode keeps extra per-vertex data in sync with every
+    # deformation). Switching modes costs ~4 ms into Object Mode and ~70 ms
+    # back into Sculpt Mode, paid once per drag instead of on every update.
+
+    def enter_fast_drag_mode(self, context, props):
+        self._fast_drag_active = False
+        if not props.fast_drag or context.mode != 'SCULPT':
+            return
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError as e:
+            print(f"Pose Chain Tool: Fast Dragging could not leave Sculpt Mode ({e}); "
+                  f"dragging in Sculpt Mode instead.")
+            return
+        self._fast_drag_active = True
+        _object_mode_drag.add(self.obj.name)
+        dprint("fast drag: switched to Object Mode")
+
+    def leave_fast_drag_mode(self, context):
+        if not getattr(self, '_fast_drag_active', False):
+            return
+        self._fast_drag_active = False
+        _object_mode_drag.discard(self.obj.name)
+        try:
+            context.view_layer.objects.active = self.obj
+            bpy.ops.object.mode_set(mode='SCULPT')
+            dprint("fast drag: back in Sculpt Mode")
+        except RuntimeError as e:
+            print(f"Pose Chain Tool: could not return to Sculpt Mode after dragging ({e})")
 
     #   lifecycle                               -
 
     def finish(self, context):
+        if getattr(self, 'dragging', False):
+            self.end_drag(context)
+        else:
+            self.leave_fast_drag_mode(context)
         if getattr(self, '_handle_view', None):
             bpy.types.SpaceView3D.draw_handler_remove(self._handle_view, 'WINDOW')
             self._handle_view = None
@@ -1799,7 +1844,16 @@ class PCT_PT_panel(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Pose Chain"
-    bl_context = "sculpt_mode"
+
+    @classmethod
+    def poll(cls, context):
+        # Sculpt Mode only (this used to be bl_context = "sculpt_mode"),
+        # plus Object Mode while Fast Dragging, so the panel doesn't vanish
+        # and reappear on every drag.
+        if context.mode == 'SCULPT':
+            return True
+        obj = context.active_object
+        return obj is not None and obj.name in _object_mode_drag
 
     def draw(self, context):
         layout = self.layout
@@ -1841,6 +1895,7 @@ class PCT_PT_panel(Panel):
             col.label(text="4. Clear Points resets. Apply bakes it.")
 
         layout.prop(props, "show_labels")
+        layout.prop(props, "fast_drag")
         layout.prop(props, "debug_logging")
         layout.separator()
 
@@ -1923,6 +1978,7 @@ def register():
 def unregister():
     _geodesic_cache.clear()
     _refresh_pending.clear()
+    _object_mode_drag.clear()
     if hasattr(bpy.types.Object, "pose_chain_tool"):
         del bpy.types.Object.pose_chain_tool
 

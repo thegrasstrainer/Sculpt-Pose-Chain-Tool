@@ -17,5 +17,6 @@ paths_exclude_pattern = [
   "/.git/",
   ".*",
   "/dist/",
+  "/tools/",
   "/CLAUDE.md",
 ]

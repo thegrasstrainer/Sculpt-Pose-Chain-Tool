@@ -10,6 +10,15 @@ Commits and pushes in this repo must use the GitHub account **thegrasstrainer** 
 
 Check `gh auth status` shows thegrasstrainer before using `gh`. Never commit as or push with another account.
 
+## Testing performance and correctness
+Both scripts run headless in Blender and are excluded from the extension zip:
+- `tools/benchmark.py` times chain build, live slider refresh and rig re-evaluation at several mesh sizes:
+  `blender --background --factory-startup --python tools/benchmark.py -- 50000 200000 1000000`
+- `tools/verify_weights.py` checks that weights still match a reference version (e.g. the last release):
+  `git show v1.5.2:__init__.py > ref.py`, then `blender --background --factory-startup --python tools/verify_weights.py -- ref.py`
+
+Run verify_weights after any change to the weighting code. Neither covers the interactive modal (placing/dragging points), which needs testing in the viewport.
+
 ## Releasing a usable version
 Every usable version goes to this repo's GitHub **Releases** as an installable zip. The owner later uploads that same zip to the Blender Extensions platform (extensions.blender.org).
 

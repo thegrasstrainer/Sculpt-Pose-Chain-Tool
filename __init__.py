@@ -31,6 +31,20 @@ POSE_CHAIN_DEBUG = False
 # adjust its threshold live is gone.
 ISLAND_CLEANUP_THRESHOLD = 0.15
 
+# Vertex group the Armature modifier uses as its own mask (the modifier's
+# "Vertex Group" field). Blender's Armature modifier divides each vertex's
+# bone weights by their total before deforming, so a vertex with only 0.1
+# of one bone's weight still moves 100% with that bone -- bone weights
+# alone can only say WHICH bone a vertex follows, never HOW MUCH it moves.
+# The modifier's mask group is what actually blends a vertex between its
+# rest position and the posed one, so every falloff (into the unposed
+# body, at the edge of a limb) is written here instead.
+MASK_GROUP_NAME = "PCT_Deform_Mask"
+
+# Measured limb radius is multiplied by this before being used as a bone's
+# minimum reach, so bumps and folds on a sculpted surface stay inside it.
+THICKNESS_MARGIN = 1.3
+
 
 def dprint(*args):
     if POSE_CHAIN_DEBUG:
@@ -80,7 +94,7 @@ def _schedule_corridor_refresh(obj_name):
             _pruned, valid_by_bone, weight_by_bone = apply_uniform_falloff_weights(
                 obj, props.armature_obj, bone_names, parent_indices,
                 positions, props.weight_falloff, props.falloff_softness,
-                props.joint_blend)
+                props.joint_blend, props.auto_thickness)
             if ISLAND_CLEANUP_THRESHOLD > 0:
                 clean_up_weight_islands(obj, bone_names, positions,
                                          valid_by_bone, weight_by_bone,
@@ -108,6 +122,18 @@ def _on_corridor_setting_changed(self, context):
     if obj is None or obj.type != 'MESH':
         return
     _schedule_corridor_refresh(obj.name)
+
+
+def _on_preserve_volume_changed(self, context):
+    """update= callback for preserve_volume -- just a modifier flag, so no
+    re-weighting is needed."""
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return
+    props = obj.pose_chain_tool
+    mod = obj.modifiers.get(props.modifier_name) if props.modifier_name else None
+    if mod is not None and mod.type == 'ARMATURE':
+        mod.use_deform_preserve_volume = props.preserve_volume
 
 
 def _bone_preview_items(self, context):
@@ -175,17 +201,29 @@ class PCT_Properties(PropertyGroup):
                     "Raise for thicker limbs, lower if it reaches into a "
                     "neighbor's area. Updates live.")
     falloff_softness: FloatProperty(
-        name="Falloff Softness", default=0.3, min=0.3, max=1.0,
+        name="Falloff Softness", default=0.6, min=0.3, max=1.0,
         update=_on_corridor_setting_changed,
         description="How gradually weight fades near a joint or bone tip. "
                     "Low values can leave dead zones with no weight. Higher "
                     "values smooth it out. Updates live.")
     joint_blend: FloatProperty(
-        name="Joint Blend", default=0.0, min=0.0, max=1.0,
+        name="Joint Blend", default=0.75, min=0.0, max=1.0,
         update=_on_corridor_setting_changed,
-        description="How much a bone shares weight with its direct parent "
-                    "and children. 0 keeps each section fully independent. "
-                    "1 blends joints smoothly. Updates live.")
+        description="How wide the smooth bend is at each joint, centered on "
+                    "the joint. 0 is a hard crease. 1 blends across about "
+                    "half of the shorter bone. Updates live.")
+    auto_thickness: BoolProperty(
+        name="Fit Limb Thickness", default=True,
+        update=_on_corridor_setting_changed,
+        description="Measure how thick the mesh is around each bone and "
+                    "never let Weight Falloff reach less than that, so thick "
+                    "limbs don't tear. Turn off if a bone grabs a nearby body "
+                    "part. Updates live.")
+    preserve_volume: BoolProperty(
+        name="Preserve Volume", default=True,
+        update=_on_preserve_volume_changed,
+        description="Dual-quaternion deformation: keeps bent joints from "
+                    "pinching or collapsing. Updates live.")
     preview_bone: EnumProperty(
         name="Preview Bone", items=_bone_preview_items,
         description="Bone to visualize with Preview Bone Influence, below.")
@@ -545,7 +583,7 @@ def compute_bone_positions(mesh_obj, arm_obj, bone_names):
     No graph search happens here.
 
     Returns {"coords_np": numpy (V,3) array, "adjacency": [...], "bones":
-    {name: {"path_length", "head_pos", "tail_pos"}, ...}}.
+    {name: {"path_length", "head_pos", "tail_pos", "thickness"}, ...}}.
     """
     mesh = mesh_obj.data
     mesh_mat = mesh_obj.matrix_world
@@ -559,64 +597,153 @@ def compute_bone_positions(mesh_obj, arm_obj, bone_names):
         head = arm_obj.matrix_world @ pbone.head
         tail = arm_obj.matrix_world @ pbone.tail
         path_length = max((tail - head).length, 1e-5)
-        bones[name] = {"path_length": path_length, "head_pos": head, "tail_pos": tail}
+        bones[name] = {"path_length": path_length, "head_pos": head, "tail_pos": tail,
+                       "thickness": estimate_limb_thickness(mesh_obj, head, tail),
+                       "tip_thickness": estimate_tip_thickness(mesh_obj, head, tail)}
+        dprint(f"  {name}: measured limb radius={bones[name]['thickness']:.4f}, "
+               f"radius at tail={bones[name]['tip_thickness']:.4f}")
     return {"coords_np": coords_np, "adjacency": adjacency, "bones": bones}
 
 
+def _median_ray_distance(mesh_obj, origins_and_dirs):
+    """Median world-space distance at which rays [(origin_world, dir_world),
+    ...] first hit mesh_obj, or 0.0 if none hit. The median shrugs off the
+    few rays that escape sideways into a torso or out through an open
+    edge."""
+    mat = mesh_obj.matrix_world
+    mat_inv = mat.inverted()
+    hits = []
+    for origin_world, dir_world in origins_and_dirs:
+        origin_local = mat_inv @ origin_world
+        dir_local = (mat_inv.to_3x3() @ dir_world).normalized()
+        try:
+            ok, loc, _normal, _index = mesh_obj.ray_cast(origin_local, dir_local)
+        except RuntimeError:
+            ok = False
+        if ok:
+            hits.append(((mat @ loc) - origin_world).length)
+    if not hits:
+        return 0.0
+    hits.sort()
+    return hits[len(hits) // 2]
+
+
+def estimate_limb_thickness(mesh_obj, head_world, tail_world, samples=(0.3, 0.5, 0.7),
+                            directions=12):
+    """Radius of the mesh around a bone, in world units, from rays cast
+    perpendicular to it at a few points along it. Points sit at the CENTER
+    of the volume (see raycast_object), so the rays start inside the limb
+    and hit its own surface first. Measured once per build and cached with
+    the bone positions, so the live sliders never re-cast."""
+    axis = tail_world - head_world
+    if axis.length < 1e-9:
+        return 0.0
+    axis = axis.normalized()
+    side = axis.orthogonal().normalized()
+    up = axis.cross(side).normalized()
+    rays = []
+    for t in samples:
+        origin = head_world.lerp(tail_world, t)
+        for k in range(directions):
+            a = 2 * math.pi * k / directions
+            rays.append((origin, side * math.cos(a) + up * math.sin(a)))
+    return _median_ray_distance(mesh_obj, rays)
+
+
+def estimate_tip_thickness(mesh_obj, head_world, tail_world, directions=32):
+    """Radius of the mesh around a bone's TAIL point, from rays cast in every
+    direction except back down the bone -- sizes whatever is at the end of a
+    limb (a hand, a foot, a head), which is often thicker than the limb
+    itself."""
+    axis = tail_world - head_world
+    if axis.length < 1e-9:
+        return 0.0
+    axis = axis.normalized()
+    rays = []
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for k in range(directions):
+        z = 1.0 - 2.0 * (k + 0.5) / directions
+        r = math.sqrt(max(0.0, 1.0 - z * z))
+        d = Vector((r * math.cos(golden * k), r * math.sin(golden * k), z))
+        if d.dot(axis) < -0.5:
+            continue
+        rays.append((tail_world, d))
+    return _median_ray_distance(mesh_obj, rays)
+
+
+def _smoothstep(x):
+    import numpy as np
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _write_group(mesh_obj, name, indices, weights):
+    """Replace vertex group `name` with exactly these (index, weight) pairs.
+
+    The group is removed and recreated rather than edited -- the Armature
+    modifier finds groups by NAME, so a fresh group is indistinguishable to
+    it, and one remove() is far cheaper than scanning every vertex for old
+    membership. Weights are quantized to 255 levels so vg.add() runs once
+    per distinct level instead of once per vertex."""
+    import numpy as np
+    QUANT_LEVELS = 255
+    vg = mesh_obj.vertex_groups.get(name)
+    if vg is not None:
+        mesh_obj.vertex_groups.remove(vg)
+    vg = mesh_obj.vertex_groups.new(name=name)
+    if len(indices) == 0:
+        return vg
+    quantized = np.clip(np.round(weights * QUANT_LEVELS).astype(np.int32), 1, QUANT_LEVELS)
+    order = np.argsort(quantized)
+    sorted_idx = indices[order]
+    sorted_q = quantized[order]
+    unique_q, group_start = np.unique(sorted_q, return_index=True)
+    group_start = np.append(group_start, len(sorted_q))
+    for gi in range(len(unique_q)):
+        s, e = group_start[gi], group_start[gi + 1]
+        vg.add(sorted_idx[s:e].tolist(), float(unique_q[gi]) / QUANT_LEVELS, 'REPLACE')
+    return vg
+
+
 def apply_uniform_falloff_weights(mesh_obj, arm_obj, bone_names, parent_indices, positions,
-                                   falloff_multiplier=0.4, falloff_softness=0.3, joint_blend=0.0):
-    """Same falloff model and logic as before (see the class-level docs
-    for the underlying idea: one uniform straight-line falloff per bone,
-    STRICT winner-take-all ownership by default, softened toward blended
-    parent/child ownership by joint_blend), but computed with numpy
-    instead of a pure-Python per-vertex, per-bone loop.
+                                   falloff_multiplier=0.4, falloff_softness=0.6, joint_blend=0.75,
+                                   auto_thickness=True):
+    """Weights the mesh in two independent layers, with numpy:
 
-    That loop   V vertices x B bones   got genuinely slow on a large,
-    many-bone mesh (confirmed: ~380k vertices x 16 bones is over 6 million
-    iterations of vector math in the Python interpreter, on every single
-    weight update). numpy runs the same math as batched array operations
-    in optimized C instead of one Python bytecode step at a time per
-    element   same formulas, same results, dramatically faster at this
-    scale. The only genuinely per-vertex Python work left is reading each
-    vertex's CURRENT vertex-group membership (to know what to remove) and
-    writing the final result back to Blender's vertex groups, since
-    Blender's own API for that isn't vectorizable.
+    1. WHICH bone(s) each vertex follows -> the Bone_i vertex groups.
+       Each vertex follows the bone whose segment is closest. Between a bone
+       and its DIRECT parent, the hand-off is a smooth blend centered on the
+       joint plane (halfway between the two bone directions), spanning
+       joint_blend * the shorter bone's length; joint_blend=0 is a hard
+       seam. Only direct parent/child pairs ever share a vertex -- siblings
+       and other branches never do, so posing one branch can't drag
+       another. Normalized per vertex (Blender normalizes them anyway).
 
-    Returns (adjusted_count, valid_by_bone, weight_by_bone)   the number
-    of (vertex, bone) influences that were adjusted, a {bone_name: numpy
-    boolean array} of which vertices ended up weighted for each bone, and
-    a {bone_name: numpy float array} of the actual weight values. Both
-    are reused directly by clean_up_weight_islands (the boolean mask so
-    it doesn't rediscover the same thing by scanning every vertex's
-    groups again, the float weights so its orphan protection can require
-    a MEANINGFUL fallback weight from another bone, not just any nonzero
-    one   a sibling bone's corridor legitimately overlapping near a
-    branch point can leave a technically-nonzero but practically
-    negligible weight there).
+    2. HOW MUCH each vertex deforms at all -> MASK_GROUP_NAME, the Armature
+       modifier's mask (see MASK_GROUP_NAME for why this can't live in the
+       bone weights). 1 inside a bone's reach, fading smoothly to 0 over
+       falloff_softness:
+         - radially, past bone length * falloff_multiplier -- never less
+           than the measured limb thickness when auto_thickness is on;
+         - axially, behind the head of a bone that hangs straight off the
+           anchor, so the body around the anchor bends a little instead of
+           tearing.
+       A leaf bone (no children) does NOT fade past its tail: whatever lies
+       beyond the last point (a hand, a head) moves with it fully, out to
+       the measured size of that end.
 
-    joint_blend (0-1) controls how much a bone's own DIRECT parent and
-    DIRECT children (not the whole ancestor chain   just the immediate
-    neighbors either side of it in the chain) are allowed to also hold
-    weight on a vertex that's primarily owned by this bone. 0 is strict
-    winner-take-all (confirmed needed: previously every direct neighbor
-    pair could share weight near their joint, which is exactly what made
-    posing one point visibly drag its neighbor's territory too). 1
-    restores that full sharing. In between, a neighbor's weight is
-    scaled down proportionally rather than either fully on or fully off,
-    so a joint can be softened gradually instead of only as a binary
-    switch between "hard seam" and "fully blended".
+    Returns (adjusted_count, valid_by_bone, weight_by_bone): which vertices
+    each bone actually moves, and each bone's effective influence (follow
+    share * mask), both reused by clean_up_weight_islands.
     """
     import numpy as np
 
-    mesh = mesh_obj.data
-    vgs = mesh_obj.vertex_groups
-    bone_vgs = {name: vgs.get(name) for name in bone_names}
     coords_np = positions["coords_np"]
     bone_positions = positions["bones"]
     n_verts = coords_np.shape[0]
 
     falloff_multiplier = max(0.01, falloff_multiplier)
-    falloff_softness = max(0.0, falloff_softness)
+    falloff_softness = max(0.05, falloff_softness)
     joint_blend = max(0.0, min(1.0, joint_blend))
 
     point_idx_of = {}
@@ -630,150 +757,116 @@ def apply_uniform_falloff_weights(mesh_obj, arm_obj, bone_names, parent_indices,
                     and point_idx_of.get(name) is not None]
     B = len(active_names)
     if B == 0 or n_verts == 0:
-        return 0
+        return 0, {}, {}
 
-    dist_matrix = np.empty((B, n_verts), dtype=np.float64)
-    weight_matrix = np.empty((B, n_verts), dtype=np.float64)
-    valid_matrix = np.empty((B, n_verts), dtype=bool)
+    # parent_bi[b] = index of bone b's direct parent BONE, or -1 when b hangs
+    # straight off the anchor (Bone_Root holds no weight, so it never counts).
+    point_to_bi = {point_idx_of[name]: i for i, name in enumerate(active_names)}
+    parent_bi = [-1] * B
+    children_bi = [[] for _ in range(B)]
+    for bi, name in enumerate(active_names):
+        pt = point_idx_of[name]
+        parent_pt = parent_indices[pt] if 0 <= pt < len(parent_indices) else -1
+        pb = point_to_bi.get(parent_pt, -1) if parent_pt > 0 else -1
+        parent_bi[bi] = pb
+        if pb >= 0:
+            children_bi[pb].append(bi)
 
+    heads = np.array([list(bone_positions[n]["head_pos"]) for n in active_names], dtype=np.float64)
+    tails = np.array([list(bone_positions[n]["tail_pos"]) for n in active_names], dtype=np.float64)
+    lengths = np.array([bone_positions[n]["path_length"] for n in active_names], dtype=np.float64)
+    axes = (tails - heads) / lengths[:, None]
+
+    dist = np.empty((B, n_verts), dtype=np.float64)
+    mask = np.zeros(n_verts, dtype=np.float64)
     for bi, name in enumerate(active_names):
         bdata = bone_positions[name]
-        path_length = bdata["path_length"]
-        radius = path_length * falloff_multiplier
-        band = max(path_length * falloff_softness, 1e-6)
-        head = bdata["head_pos"]
-        tail = bdata["tail_pos"]
-        head_np = np.array([head.x, head.y, head.z], dtype=np.float64)
-        tail_np = np.array([tail.x, tail.y, tail.z], dtype=np.float64)
-        ab = tail_np - head_np
-        ab_len_sq = float(ab.dot(ab))
-        if ab_len_sq < 1e-12:
-            ab_len_sq = 1e-12
-
-        rel = coords_np - head_np                      # (V, 3)
-        t_raw = rel @ ab / ab_len_sq                    # (V,)
+        L = lengths[bi]
+        t_raw = (coords_np - heads[bi]) @ axes[bi] / L          # 0 at head, 1 at tail
         t_clamped = np.clip(t_raw, 0.0, 1.0)
-        closest = head_np + t_clamped[:, None] * ab     # (V, 3)
-        dist = np.linalg.norm(coords_np - closest, axis=1)  # (V,)
+        closest = heads[bi] + (t_clamped * L)[:, None] * axes[bi]
+        d = np.linalg.norm(coords_np - closest, axis=1)
+        dist[bi] = d
 
-        overshoot = np.where(t_raw < 0.0, -t_raw * path_length,
-                              np.where(t_raw > 1.0, (t_raw - 1.0) * path_length, 0.0))
-        tt = np.clip(overshoot / band, 0.0, 1.0)
-        dir_factor = 1.0 - (tt * tt * (3.0 - 2.0 * tt))
+        reach = L * falloff_multiplier
+        if auto_thickness:
+            reach = max(reach, bdata.get("thickness", 0.0) * THICKNESS_MARGIN)
+        reach_v = np.full(n_verts, reach)
+        if not children_bi[bi] and auto_thickness:
+            # Leaf: grow the reach toward the tail so the whole end of the
+            # limb (sized by rays cast from the tail) is covered, starting
+            # one end-radius before the tail so there's no step at the tail.
+            tip_reach = max(reach, bdata.get("tip_thickness", 0.0) * THICKNESS_MARGIN)
+            if tip_reach > reach:
+                t0 = max(0.0, 1.0 - tip_reach / L)
+                ramp = _smoothstep((t_raw - t0) / max(1.0 - t0, 1e-6))
+                reach_v = reach + (tip_reach - reach) * ramp
+        radial = 1.0 - _smoothstep((d - reach_v) / np.maximum(reach_v * falloff_softness, 1e-6))
 
-        weight = t_clamped * t_clamped * (3.0 - 2.0 * t_clamped) * dir_factor
+        if parent_bi[bi] < 0:
+            behind = -t_raw * L                                   # > 0 behind the head
+            axial = 1.0 - _smoothstep(behind / max(L * falloff_softness, 1e-6))
+        else:
+            axial = 1.0
+        np.maximum(mask, radial * axial, out=mask)
 
-        dist_matrix[bi] = dist
-        weight_matrix[bi] = weight
-        valid_matrix[bi] = (dist <= radius) & (weight > 1e-6)
+        dprint(f"  {name}: path_length={L:.4f}, reach={reach:.4f} "
+               f"(falloff {L * falloff_multiplier:.4f}, measured radius "
+               f"{bdata.get('thickness', 0.0):.4f}), leaf={not children_bi[bi]}")
 
-        dprint(f"  {name}: path_length={path_length:.4f}, "
-               f"falloff_multiplier={falloff_multiplier}, radius={radius:.4f}, "
-               f"falloff_softness={falloff_softness}, band={band:.4f}")
+    # Downstream share at each bone's HEAD joint (bones with a parent bone):
+    # 0.5 exactly on the joint plane, 1 a half-width down this bone, 0 a
+    # half-width up the parent.
+    joint_share = [None] * B
+    for bi in range(B):
+        pb = parent_bi[bi]
+        if pb < 0:
+            continue
+        normal = axes[pb] + axes[bi]
+        nl = np.linalg.norm(normal)
+        normal = normal / nl if nl > 1e-6 else axes[bi]
+        half_width = max(joint_blend * 0.5 * min(lengths[pb], lengths[bi]), 1e-6)
+        s = (coords_np - heads[bi]) @ normal
+        joint_share[bi] = _smoothstep(0.5 + s / (2.0 * half_width))
 
-    has_any_valid = valid_matrix.any(axis=0)                      # (V,)
-    masked_dist = np.where(valid_matrix, dist_matrix, np.inf)
-    primary_bone_idx = np.argmin(masked_dist, axis=0)             # (V,)
+    primary = np.argmin(dist, axis=0)
+    share = np.zeros((B, n_verts), dtype=np.float64)
+    for bi in range(B):
+        sel = primary == bi
+        if not sel.any():
+            continue
+        own = np.ones(int(sel.sum()))
+        pb = parent_bi[bi]
+        if pb >= 0:
+            js = joint_share[bi][sel]
+            own *= js
+            share[pb, sel] += 1.0 - js
+        for ci in children_bi[bi]:
+            cs = joint_share[ci][sel]
+            share[ci, sel] += cs
+            own *= 1.0 - cs
+        share[bi, sel] += own
+    share /= np.maximum(share.sum(axis=0), 1e-12)[None, :]
 
-    # STRICT, EXCLUSIVE ownership by default: only the single closest bone
-    # keeps any weight on a given vertex   not "closest bone, plus its
-    # own parent and child too" the way the earlier lineage-sharing
-    # version worked. That earlier version deliberately let a bone and
-    # its own direct parent/child share weight near their shared joint,
-    # for a smoothly blended transition   confirmed, directly, that this
-    # smooth blending IS the "child shares influence with its parent"
-    # problem: posing one bone would visibly drag its neighbor's
-    # territory too, since neighbors genuinely held partial weight on the
-    # same vertices. Winner-take-all means every vertex belongs to
-    # exactly one bone, full stop, so posing any one bone can only ever
-    # move the vertices that are exclusively its own   at the cost of a
-    # hard, non-blended seam at every joint instead of a soft one.
-    #
-    # joint_blend reintroduces a CONTROLLED, ADJUSTABLE amount of that
-    # sharing back in, but only between DIRECT neighbors (a bone and its
-    # own immediate parent/child specifically   not the whole lineage
-    # the old version shared across), and scaled continuously rather than
-    # either fully on or fully off.
-    is_primary = np.arange(B)[:, None] == primary_bone_idx[None, :]  # (B, V)
+    effective = share * mask[None, :]
+    final_valid = effective > 1e-4
 
-    if joint_blend > 0.0:
-        # direct_neighbor_ok[i, j] = is bone j the direct parent or a
-        # direct child of bone i (immediate chain neighbors only).
-        name_to_idx = {name: i for i, name in enumerate(active_names)}
-        point_to_bone = {point_idx_of[name]: name for name in active_names}
-        direct_neighbor_ok = np.zeros((B, B), dtype=bool)
-        for name in active_names:
-            i = name_to_idx[name]
-            pt = point_idx_of[name]
-            parent_pt = parent_indices[pt] if 0 <= pt < len(parent_indices) else -1
-            parent_bone = point_to_bone.get(parent_pt)
-            if parent_bone is not None and parent_bone in name_to_idx:
-                j = name_to_idx[parent_bone]
-                direct_neighbor_ok[i, j] = True
-                direct_neighbor_ok[j, i] = True
-
-        # is_direct_neighbor[b, v] = is bone b a direct parent/child of
-        # vertex v's primary bone   fancy-indexed across all vertices.
-        is_direct_neighbor = direct_neighbor_ok[:, primary_bone_idx]   # (B, V)
-        blend_scale = np.where(is_primary, 1.0,
-                                np.where(is_direct_neighbor, joint_blend, 0.0))
-        final_valid = valid_matrix & (is_primary | is_direct_neighbor) & has_any_valid[None, :]
-        final_weight = np.where(final_valid, weight_matrix * blend_scale, 0.0)
-    else:
-        final_valid = valid_matrix & is_primary & has_any_valid[None, :]
-        final_weight = np.where(final_valid, weight_matrix, 0.0)
-
-    # Writing results back to Blender is the only part left that can't be
-    # vectorized (Blender's vertex-group API has no bulk/numpy interface),
-    # but the NAIVE way to do it   read back current membership by
-    # scanning every vertex, then call vg.add() once per vertex   was
-    # confirmed to be the actual remaining bottleneck on a large mesh
-    # (Bone_1 alone had ~93k vertices, meaning ~93k individual Python/API
-    # calls). Two changes fix this without changing the result at all:
-    #
-    # 1. Instead of reading back a bone's current membership (a full scan
-    #    of every vertex on the mesh) to compute a precise removal list,
-    #    just remove and recreate the vertex group fresh. This is exactly
-    #    equivalent   an armature modifier binds vertex groups by NAME,
-    #    not by object identity or index, so a freshly recreated group
-    #    with the same name is indistinguishable to it   and removing a
-    #    whole group is one API call regardless of how many vertices were
-    #    in it, versus scanning the entire mesh to find out.
-    # 2. Instead of one vg.add() call per vertex, group vertices by a
-    #    quantized weight value (255 discrete levels   far finer than
-    #    visibly perceptible) and call vg.add() ONCE PER DISTINCT WEIGHT
-    #    LEVEL with the full list of vertex indices at that level. This
-    #    turns up to tens of thousands of calls into at most 255.
-    QUANT_LEVELS = 255
     adjusted = 0
     for bi, name in enumerate(active_names):
-        vg = bone_vgs.get(name)
-        if vg is not None:
-            mesh_obj.vertex_groups.remove(vg)
-        vg = mesh_obj.vertex_groups.new(name=name)
+        idx = np.nonzero(final_valid[bi])[0]
+        _write_group(mesh_obj, name, idx, share[bi, idx])
+        adjusted += len(idx)
 
-        new_indices = np.nonzero(final_valid[bi])[0]
-        if len(new_indices) == 0:
-            continue
-        weights_for_new = final_weight[bi, new_indices]
-        quantized = np.clip(np.round(weights_for_new * QUANT_LEVELS).astype(np.int32),
-                             1, QUANT_LEVELS)
+    mask_idx = np.nonzero(mask > 0.5 / 255)[0]
+    _write_group(mesh_obj, MASK_GROUP_NAME, mask_idx, mask[mask_idx])
+    for mod in mesh_obj.modifiers:
+        if mod.type == 'ARMATURE' and mod.object == arm_obj:
+            mod.vertex_group = MASK_GROUP_NAME
 
-        order = np.argsort(quantized)
-        sorted_idx = new_indices[order]
-        sorted_q = quantized[order]
-        unique_q, group_start = np.unique(sorted_q, return_index=True)
-        group_start = np.append(group_start, len(sorted_q))
-        for gi in range(len(unique_q)):
-            s, e = group_start[gi], group_start[gi + 1]
-            idx_list = sorted_idx[s:e].tolist()
-            weight_val = float(unique_q[gi]) / QUANT_LEVELS
-            vg.add(idx_list, weight_val, 'REPLACE')
-        adjusted += len(new_indices)
-
-    dprint(f"apply_uniform_falloff_weights: {adjusted} influence(s) adjusted total")
+    dprint(f"apply_uniform_falloff_weights: {adjusted} influence(s) written, "
+           f"{len(mask_idx)} vertex(es) deform")
     valid_by_bone = {name: final_valid[bi] for bi, name in enumerate(active_names)}
-    weight_by_bone = {name: final_weight[bi] for bi, name in enumerate(active_names)}
+    weight_by_bone = {name: effective[bi] for bi, name in enumerate(active_names)}
     return adjusted, valid_by_bone, weight_by_bone
 
 
@@ -1004,103 +1097,6 @@ def clean_up_weight_islands(mesh_obj, bone_names, positions, valid_by_bone, weig
     return removed_total
 
 
-def fill_unweighted_vertices(mesh_obj, arm_obj, bone_names, adjacency):
-    """Guarantee every disconnected mesh island is influenced by some bone.
-
-    Automatic (heat-map) Weights propagates weight through CONNECTED mesh
-    topology from each bone   if the mesh is actually several separate
-    pieces joined into one object (Ctrl+J), heat can't cross a seam that
-    isn't really welded, so any island it can't reach silently gets no
-    weight at all and never moves. This doesn't raise an error (so the
-    envelope-weights fallback never triggers), it just quietly under-covers
-    the mesh.
-
-    Works per ISLAND rather than per vertex: deciding vertex-by-vertex can
-    split a single disconnected piece across two different bones
-    inconsistently   deciding once per island, using its overall centroid,
-    keeps each disconnected piece moving as one consistent rigid unit.
-    Bone_Root is intentionally excluded from the candidates (it's just a
-    structural pivot at the anchor, not meant to hold mesh weight). Returns
-    the number of vertices it had to fix.
-    """
-    mesh = mesh_obj.data
-    vgs = mesh_obj.vertex_groups
-    bone_vgs = [vgs.get(name) for name in bone_names]
-    group_indices = {vg.index for vg in bone_vgs if vg}
-    if not group_indices:
-        return 0
-
-    segments = []
-    for name in bone_names:
-        pbone = arm_obj.pose.bones.get(name)
-        if pbone is None:
-            segments.append(None)
-            continue
-        segments.append((arm_obj.matrix_world @ pbone.head, arm_obj.matrix_world @ pbone.tail))
-
-    mesh_mat = mesh_obj.matrix_world
-
-    def vertex_weight(vi):
-        return sum(g.weight for g in mesh.vertices[vi].groups if g.group in group_indices)
-
-    islands = get_mesh_islands(adjacency)
-    dprint(f"build_chain: mesh has {len(islands)} disconnected island(s), "
-           f"{len(bone_names)} bone(s): {bone_names}")
-    for i, seg in enumerate(segments):
-        if seg is None:
-            dprint(f"  bone {bone_names[i]}: MISSING (no pose bone found)")
-        else:
-            dprint(f"  bone {bone_names[i]}: head={tuple(round(c, 4) for c in seg[0])} "
-                   f"tail={tuple(round(c, 4) for c in seg[1])}")
-
-    fixed = 0
-    for island_idx, island in enumerate(islands):
-        trusted = any(vertex_weight(vi) > 1e-6 for vi in island)
-
-        centroid = Vector((0.0, 0.0, 0.0))
-        for vi in island:
-            centroid += mesh_mat @ mesh.vertices[vi].co
-        centroid /= len(island)
-
-        if trusted:
-            dprint(f"  island {island_idx}: {len(island)} verts, "
-                   f"centroid={tuple(round(c, 4) for c in centroid)}   "
-                   f"TRUSTED (Automatic Weights already reached it), left as-is")
-            continue
-
-        dists = []
-        for i, seg in enumerate(segments):
-            if seg is None:
-                dists.append(None)
-                continue
-            dists.append(point_segment_distance(centroid, seg[0], seg[1]))
-        dist_report = ", ".join(
-            f"{bone_names[i]}={d:.4f}" if d is not None else f"{bone_names[i]}=n/a"
-            for i, d in enumerate(dists))
-
-        best_idx, best_dist = None, None
-        for i, d in enumerate(dists):
-            if d is None:
-                continue
-            if best_dist is None or d < best_dist:
-                best_dist, best_idx = d, i
-
-        chosen = bone_names[best_idx] if best_idx is not None else "NONE"
-        if best_idx is not None:
-            dprint(f"  island {island_idx}: {len(island)} verts, "
-                   f"centroid={tuple(round(c, 4) for c in centroid)}   UNREACHED, "
-                   f"distances=[{dist_report}] -> REBOUND to {chosen} (dist={best_dist:.4f})")
-        else:
-            dprint(f"  island {island_idx}: {len(island)} verts   UNREACHED, no valid bone found")
-
-        if best_idx is not None and bone_vgs[best_idx] is not None:
-            bone_vgs[best_idx].add(island, 1.0, 'REPLACE')
-            fixed += len(island)
-
-    dprint(f"build_chain: fill_unweighted_vertices fixed {fixed} vertex(es) total")
-    return fixed
-
-
 def build_chain(context, mesh_obj):
     """Create a hidden Armature matching the placed point TREE, parent the
     mesh to it with Automatic Weights, and record it on the tool properties.
@@ -1167,29 +1163,18 @@ def build_chain(context, mesh_obj):
         arm_obj.select_set(True)
         context.view_layer.objects.active = arm_obj
 
-        try:
-            bpy.ops.object.parent_set(type='ARMATURE_AUTO')
-        except RuntimeError as e:
-            # Automatic (heat-map) weighting can fail on tricky topology  
-            # fall back to a simpler weighting scheme rather than aborting.
-            print(f"Pose Chain Tool: Automatic Weights failed ({e}), "
-                  f"falling back to envelope weights.")
-            bpy.ops.object.parent_set(type='ARMATURE_ENVELOPE')
+        # Empty groups, not Automatic Weights: apply_uniform_falloff_weights
+        # below recreates every Bone_i group from scratch, so heat weights
+        # were computed (slowly, and sometimes failing outright on sculpt
+        # topology) only to be thrown away.
+        bpy.ops.object.parent_set(type='ARMATURE_NAME')
 
         # Bone_Root is a REAL bone in the armature (it has to be, for FK
-        # parenting to work), so Automatic/Envelope Weights doesn't know
-        # it's meant to be a pure structural pivot   it heat-diffuses
-        # weight to it exactly like any other bone, often across a broad
-        # swath of the mesh. The corridor weighting below only ever looks
-        # at bone_names (Bone_1, Bone_2, ...), which never includes
-        # Bone_Root, so that weight would otherwise sit there completely
-        # untouched: any vertex with leftover Bone_Root weight moves
-        # whenever the anchor is translated, dragging mesh along with a
-        # point that's meant to be a pure positioning handle   the
-        # anchor should move the CHAIN, with its children handling all
-        # actual deformation. Bone_Root must never hold any direct mesh
-        # weight; only its TRANSFORM should ever reach the mesh, cascaded
-        # through normal FK parenting to its child bones.
+        # parenting to work), but it's a pure structural pivot: the anchor
+        # should move the CHAIN, with its children handling all actual
+        # deformation. Bone_Root must never hold any direct mesh weight;
+        # only its TRANSFORM should ever reach the mesh, cascaded through
+        # normal FK parenting to its child bones.
         root_vg = mesh_obj.vertex_groups.get("Bone_Root")
         if root_vg is not None:
             mesh_obj.vertex_groups.remove(root_vg)
@@ -1199,41 +1184,24 @@ def build_chain(context, mesh_obj):
 
         bone_names = [f"Bone_{i}" for i in range(1, len(points_world))]
 
-        props.created_vertex_groups.clear()
-        for name in bone_names:
-            if mesh_obj.vertex_groups.get(name) is not None:
-                entry = props.created_vertex_groups.add()
-                entry.name = name
-
-        # No expensive graph search anymore   just extracting bone
-        # positions, mesh coordinates, and edge adjacency. Computed here
-        # (before fill_unweighted_vertices) purely so its adjacency can be
-        # reused there instead of rebuilt from scratch   this doesn't
-        # touch vertex group weights at all, so it's safe to compute
-        # before fill_unweighted_vertices despite running first now.
+        # Bone positions, mesh coordinates, edge adjacency (for island
+        # cleanup) and measured limb thickness, cached so the live sliders
+        # can re-weight without re-extracting any of it.
         positions = compute_bone_positions(mesh_obj, arm_obj, bone_names)
         _geodesic_cache[mesh_obj.name] = positions
 
-        # fill_unweighted_vertices MUST run before apply_uniform_falloff_weights,
-        # on Automatic Weights' raw output   the falloff model below
-        # intentionally reduces most of a large connected mesh to zero
-        # weight, which would look identical to "a genuinely disconnected
-        # island Automatic Weights never reached" if checked afterward,
-        # misfiring a whole-island rebind onto perfectly ordinary,
-        # connected geometry.
-        fixed = fill_unweighted_vertices(mesh_obj, arm_obj, bone_names, positions["adjacency"])
-        if fixed:
-            print(f"Pose Chain Tool: {fixed} vertex(es) had no weight from Automatic "
-                  f"Weights (likely a disconnected mesh island from a Join)   "
-                  f"assigned them to their nearest bone directly.")
-
         pruned, valid_by_bone, weight_by_bone = apply_uniform_falloff_weights(
             mesh_obj, arm_obj, bone_names, parent_indices, positions,
-            props.weight_falloff, props.falloff_softness, props.joint_blend)
+            props.weight_falloff, props.falloff_softness, props.joint_blend,
+            props.auto_thickness)
         if pruned:
-            print(f"Pose Chain Tool: smoothly scaled down {pruned} vertex influence(s) by "
-                  f"distance so far-away parts of the mesh fade out of this chain's "
-                  f"deformation instead of getting swept in.")
+            print(f"Pose Chain Tool: weighted {pruned} vertex influence(s) to this chain.")
+
+        props.created_vertex_groups.clear()
+        for name in bone_names + [MASK_GROUP_NAME]:
+            if mesh_obj.vertex_groups.get(name) is not None:
+                entry = props.created_vertex_groups.add()
+                entry.name = name
 
         if ISLAND_CLEANUP_THRESHOLD > 0:
             cleaned = clean_up_weight_islands(mesh_obj, bone_names, positions,
@@ -1249,6 +1217,8 @@ def build_chain(context, mesh_obj):
 
         mod = next((m for m in mesh_obj.modifiers
                     if m.type == 'ARMATURE' and m.object == arm_obj), None)
+        if mod is not None:
+            mod.use_deform_preserve_volume = props.preserve_volume
         props.modifier_name = mod.name if mod else ""
         props.armature_obj = arm_obj
 
@@ -1879,6 +1849,8 @@ class PCT_PT_panel(Panel):
             layout.prop(props, "weight_falloff")
             layout.prop(props, "falloff_softness")
             layout.prop(props, "joint_blend")
+            layout.prop(props, "auto_thickness")
+            layout.prop(props, "preserve_volume")
             layout.operator("pct.activate", icon='PLAY', text="Activate")
 
         elif props.state == 'PLACING':
@@ -1902,6 +1874,8 @@ class PCT_PT_panel(Panel):
             col.prop(props, "weight_falloff")
             col.prop(props, "falloff_softness")
             col.prop(props, "joint_blend")
+            col.prop(props, "auto_thickness")
+            col.prop(props, "preserve_volume")
 
             layout.separator()
             col = layout.column(align=True)

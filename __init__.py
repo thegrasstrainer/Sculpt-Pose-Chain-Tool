@@ -105,6 +105,8 @@ def _schedule_corridor_refresh(obj_name):
                                          valid_by_bone, weight_by_bone,
                                          props.falloff_softness,
                                          ISLAND_CLEANUP_THRESHOLD)
+            # Refit/re-weight the lattice too (or remove it in Bones mode).
+            apply_deform_mode(obj, props, positions)
         except Exception as e:
             print(f"Pose Chain Tool: live weight update failed ({e})")
             return None
@@ -139,6 +141,21 @@ def _on_preserve_volume_changed(self, context):
     mod = obj.modifiers.get(props.modifier_name) if props.modifier_name else None
     if mod is not None and mod.type == 'ARMATURE':
         mod.use_deform_preserve_volume = props.preserve_volume
+    lat_obj = bpy.data.objects.get(_lattice_object_name(obj))
+    if lat_obj is not None:
+        for m in lat_obj.modifiers:
+            if m.type == 'ARMATURE':
+                m.use_deform_preserve_volume = props.preserve_volume
+
+
+def _on_deform_mode_changed(self, context):
+    """update= callback for deform_mode and lattice_resolution: switching
+    modes or lattice detail only needs the debounced refresh, which re-runs
+    the weighting and then sets up (or removes) the lattice."""
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return
+    _schedule_corridor_refresh(obj.name)
 
 
 def _bone_preview_items(self, context):
@@ -241,6 +258,23 @@ class PCT_Properties(PropertyGroup):
     show_help: BoolProperty(
         name="Show Help", default=True,
         description="Show the how-to-use instructions in this panel")
+    deform_mode: EnumProperty(
+        name="Bend Style",
+        items=[
+            ('BONES', "Sharp (Bones)",
+             "Each section follows its own bone directly: crisp joints"),
+            ('LATTICE', "Smooth (Lattice)",
+             "The bones bend a lattice cage around the posed region and the "
+             "mesh follows it: softer, rounder bends. Parts closer together "
+             "than a lattice cell (fingers, an arm against the body) can pull "
+             "on each other; raise Lattice Detail to keep them apart"),
+        ],
+        default='BONES', update=_on_deform_mode_changed)
+    lattice_resolution: IntProperty(
+        name="Lattice Detail", default=16, min=4, max=48,
+        update=_on_deform_mode_changed,
+        description="Lattice points along its longest side. Higher keeps nearby "
+                    "parts more independent; lower gives broader, smoother bends")
     fast_drag: BoolProperty(
         name="Fast Dragging", default=True,
         description="Switch to Object Mode while dragging a point and back to "
@@ -690,6 +724,67 @@ def _write_group(mesh_obj, name, indices, weights):
     return vg
 
 
+def _segment_distances(coords_np, heads, axes, lengths):
+    """(B, N) straight-line distance from every point to every bone segment."""
+    import numpy as np
+    B = len(lengths)
+    dist = np.empty((B, coords_np.shape[0]), dtype=np.float64)
+    for bi in range(B):
+        L = lengths[bi]
+        t = np.clip((coords_np - heads[bi]) @ axes[bi] / L, 0.0, 1.0)
+        closest = heads[bi] + (t * L)[:, None] * axes[bi]
+        dist[bi] = np.linalg.norm(coords_np - closest, axis=1)
+    return dist
+
+
+def _bone_follow_shares(coords_np, heads, axes, lengths, parent_bi, children_bi, joint_blend,
+                        dist=None):
+    """(B, N) share of each bone in each point's motion, summing to 1 per
+    point: the closest bone owns a point, blended with its DIRECT parent /
+    children across each joint plane by joint_blend. Used for mesh vertices
+    (Bone_i groups) and for lattice points in Smooth (Lattice) mode."""
+    import numpy as np
+    B = len(lengths)
+    n = coords_np.shape[0]
+    if dist is None:
+        dist = _segment_distances(coords_np, heads, axes, lengths)
+
+    # Downstream share at each bone's HEAD joint (bones with a parent bone):
+    # 0.5 exactly on the joint plane, 1 a half-width down this bone, 0 a
+    # half-width up the parent.
+    joint_share = [None] * B
+    for bi in range(B):
+        pb = parent_bi[bi]
+        if pb < 0:
+            continue
+        normal = axes[pb] + axes[bi]
+        nl = np.linalg.norm(normal)
+        normal = normal / nl if nl > 1e-6 else axes[bi]
+        half_width = max(joint_blend * 0.5 * min(lengths[pb], lengths[bi]), 1e-6)
+        s = (coords_np - heads[bi]) @ normal
+        joint_share[bi] = _smoothstep(0.5 + s / (2.0 * half_width))
+
+    primary = np.argmin(dist, axis=0)
+    share = np.zeros((B, n), dtype=np.float64)
+    for bi in range(B):
+        sel = primary == bi
+        if not sel.any():
+            continue
+        own = np.ones(int(sel.sum()))
+        pb = parent_bi[bi]
+        if pb >= 0:
+            js = joint_share[bi][sel]
+            own *= js
+            share[pb, sel] += 1.0 - js
+        for ci in children_bi[bi]:
+            cs = joint_share[ci][sel]
+            share[ci, sel] += cs
+            own *= 1.0 - cs
+        share[bi, sel] += own
+    share /= np.maximum(share.sum(axis=0), 1e-12)[None, :]
+    return share
+
+
 def apply_uniform_falloff_weights(mesh_obj, arm_obj, bone_names, parent_indices, positions,
                                    falloff_multiplier=0.4, falloff_softness=0.6, joint_blend=0.75,
                                    auto_thickness=True):
@@ -799,39 +894,17 @@ def apply_uniform_falloff_weights(mesh_obj, arm_obj, bone_names, parent_indices,
                f"(falloff {L * falloff_multiplier:.4f}, measured radius "
                f"{bdata.get('thickness', 0.0):.4f}), leaf={not children_bi[bi]}")
 
-    # Downstream share at each bone's HEAD joint (bones with a parent bone):
-    # 0.5 exactly on the joint plane, 1 a half-width down this bone, 0 a
-    # half-width up the parent.
-    joint_share = [None] * B
-    for bi in range(B):
-        pb = parent_bi[bi]
-        if pb < 0:
-            continue
-        normal = axes[pb] + axes[bi]
-        nl = np.linalg.norm(normal)
-        normal = normal / nl if nl > 1e-6 else axes[bi]
-        half_width = max(joint_blend * 0.5 * min(lengths[pb], lengths[bi]), 1e-6)
-        s = (coords_np - heads[bi]) @ normal
-        joint_share[bi] = _smoothstep(0.5 + s / (2.0 * half_width))
+    share = _bone_follow_shares(coords_np, heads, axes, lengths, parent_bi, children_bi,
+                                joint_blend, dist)
 
-    primary = np.argmin(dist, axis=0)
-    share = np.zeros((B, n_verts), dtype=np.float64)
-    for bi in range(B):
-        sel = primary == bi
-        if not sel.any():
-            continue
-        own = np.ones(int(sel.sum()))
-        pb = parent_bi[bi]
-        if pb >= 0:
-            js = joint_share[bi][sel]
-            own *= js
-            share[pb, sel] += 1.0 - js
-        for ci in children_bi[bi]:
-            cs = joint_share[ci][sel]
-            share[ci, sel] += cs
-            own *= 1.0 - cs
-        share[bi, sel] += own
-    share /= np.maximum(share.sum(axis=0), 1e-12)[None, :]
+    # Kept with the cached positions so Smooth (Lattice) mode can weight its
+    # lattice points with exactly the same bone model, and size the lattice
+    # to the region that actually deforms.
+    positions["last_weighting"] = {
+        "mask": mask, "active_names": list(active_names), "heads": heads, "axes": axes,
+        "lengths": lengths, "parent_bi": list(parent_bi),
+        "children_bi": [list(c) for c in children_bi], "joint_blend": joint_blend,
+    }
 
     effective = share * mask[None, :]
     final_valid = effective > 1e-4
@@ -1082,6 +1155,133 @@ def clean_up_weight_islands(mesh_obj, bone_names, positions, valid_by_bone, weig
     return removed_total
 
 
+#                                      -
+# Smooth (Lattice) deform mode
+#                                      -
+#
+# Optional, on top of the normal rig. The bones stay exactly as they are
+# (same FK chain, same dragging); they just deform a lattice cage instead of
+# the mesh directly, and the mesh follows the lattice:
+#
+#   bones --Armature modifier--> lattice points --Lattice modifier--> mesh
+#
+# The lattice smooths every bend over its cells, giving rounder, softer
+# joints. The mesh's own PCT_Deform_Mask still limits WHERE the mesh moves
+# (a lattice on its own deforms the whole mesh, not just what's inside its
+# box), so the falloff sliders keep working the same way.
+#
+# One lattice for the whole chain rather than one per segment: each Lattice
+# modifier costs about as much as the Armature modifier per update
+# (benchmarked ~8 ms each at 714k vertices in Object Mode), so 16 segments
+# would be ~16x slower, and separate lattices would leave seams at joints.
+
+LATTICE_MOD_NAME = "PoseChain Lattice"
+
+
+def _lattice_object_name(mesh_obj):
+    return f"{mesh_obj.name}_PoseChainLattice"
+
+
+def update_lattice(mesh_obj, arm_obj, positions, resolution=16, preserve_volume=False):
+    """Create (or refit) the chain's lattice around the region the mask lets
+    deform, and weight its points to the bones with the same bone model as
+    the mesh. Returns the lattice object, or None if there's nothing to fit."""
+    import numpy as np
+    w = positions.get("last_weighting")
+    if not w or not w["active_names"]:
+        return None
+    coords = positions["coords_np"]
+    region = coords[w["mask"] > 0.5 / 255]
+    if len(region) == 0:
+        return None
+
+    lo = region.min(axis=0)
+    hi = region.max(axis=0)
+    size = hi - lo
+    pad = max(float(size.max()) * 0.05, 1e-4)
+    lo = lo - pad
+    hi = hi + pad
+    size = hi - lo
+    res = np.clip(np.round(resolution * size / size.max()), 3, resolution).astype(int)
+
+    name = _lattice_object_name(mesh_obj)
+    lat_obj = bpy.data.objects.get(name)
+    if lat_obj is None or lat_obj.type != 'LATTICE':
+        lat = bpy.data.lattices.new(name)
+        lat_obj = bpy.data.objects.new(name, lat)
+        collection = mesh_obj.users_collection[0] if mesh_obj.users_collection \
+            else bpy.context.scene.collection
+        collection.objects.link(lat_obj)
+    lat = lat_obj.data
+    for vg in list(lat_obj.vertex_groups):
+        lat_obj.vertex_groups.remove(vg)
+    lat.points_u, lat.points_v, lat.points_w = (int(r) for r in res)
+    lat.interpolation_type_u = lat.interpolation_type_v = lat.interpolation_type_w = 'KEY_BSPLINE'
+    lat_obj.parent = None
+    lat_obj.location = tuple((lo + hi) / 2.0)
+    lat_obj.rotation_euler = (0.0, 0.0, 0.0)
+    lat_obj.scale = tuple(size)
+
+    n_pts = len(lat.points)
+    local = np.empty(n_pts * 3, dtype=np.float64)
+    lat.points.foreach_get("co", local)
+    pts_world = local.reshape(n_pts, 3) * size + (lo + hi) / 2.0
+
+    share = _bone_follow_shares(pts_world, w["heads"], w["axes"], w["lengths"],
+                                w["parent_bi"], w["children_bi"], w["joint_blend"])
+    for bi, bone_name in enumerate(w["active_names"]):
+        idx = np.nonzero(share[bi] > 1e-4)[0]
+        _write_group(lat_obj, bone_name, idx, share[bi, idx])
+
+    mod = next((m for m in lat_obj.modifiers if m.type == 'ARMATURE'), None)
+    if mod is None:
+        mod = lat_obj.modifiers.new("Armature", 'ARMATURE')
+    mod.object = arm_obj
+    mod.use_deform_preserve_volume = preserve_volume
+
+    lat_obj.hide_set(True)
+    lat_obj.hide_select = True
+    lat_obj.hide_render = True
+    dprint(f"update_lattice: {tuple(int(r) for r in res)} points, size={tuple(round(s, 3) for s in size)}")
+    return lat_obj
+
+
+def remove_lattice(mesh_obj):
+    mod = mesh_obj.modifiers.get(LATTICE_MOD_NAME)
+    if mod is not None:
+        mesh_obj.modifiers.remove(mod)
+    lat_obj = bpy.data.objects.get(_lattice_object_name(mesh_obj))
+    if lat_obj is not None and lat_obj.type == 'LATTICE':
+        lat = lat_obj.data
+        bpy.data.objects.remove(lat_obj, do_unlink=True)
+        if lat is not None and lat.users == 0:
+            bpy.data.lattices.remove(lat)
+
+
+def apply_deform_mode(mesh_obj, props, positions):
+    """Make the mesh deform the way props.deform_mode says: straight from
+    the bones (Armature modifier), or through the lattice (Lattice modifier,
+    Armature modifier switched off). Safe to call repeatedly."""
+    arm_mod = mesh_obj.modifiers.get(props.modifier_name) if props.modifier_name else None
+    if props.deform_mode == 'LATTICE' and props.armature_obj is not None:
+        lat_obj = update_lattice(mesh_obj, props.armature_obj, positions,
+                                 props.lattice_resolution, props.preserve_volume)
+        if lat_obj is not None:
+            lat_mod = mesh_obj.modifiers.get(LATTICE_MOD_NAME)
+            if lat_mod is None:
+                lat_mod = mesh_obj.modifiers.new(LATTICE_MOD_NAME, 'LATTICE')
+            lat_mod.object = lat_obj
+            lat_mod.vertex_group = MASK_GROUP_NAME
+            if arm_mod is not None:
+                arm_mod.show_viewport = False
+                arm_mod.show_render = False
+            return
+    remove_lattice(mesh_obj)
+    if arm_mod is not None:
+        arm_mod.show_viewport = True
+        arm_mod.show_render = True
+
+
 def build_chain(context, mesh_obj):
     """Create a hidden Armature matching the placed point TREE, parent the
     mesh to it with Automatic Weights, and record it on the tool properties.
@@ -1206,6 +1406,7 @@ def build_chain(context, mesh_obj):
             mod.use_deform_preserve_volume = props.preserve_volume
         props.modifier_name = mod.name if mod else ""
         props.armature_obj = arm_obj
+        apply_deform_mode(mesh_obj, props, positions)
 
         context.view_layer.objects.active = mesh_obj
         mesh_obj.select_set(True)
@@ -1214,6 +1415,10 @@ def build_chain(context, mesh_obj):
 
     except Exception as e:
         print(f"Pose Chain Tool: failed to build chain: {e}")
+        try:
+            remove_lattice(mesh_obj)
+        except Exception:
+            pass
         if arm_obj is not None and arm_obj.name in bpy.data.objects:
             try:
                 bpy.data.objects.remove(arm_obj, do_unlink=True)
@@ -1234,6 +1439,10 @@ def cleanup_chain(context, mesh_obj):
     the deformation, or directly if you want to discard it (the modifier
     just loses its target and stops deforming once the armature is gone)."""
     props = mesh_obj.pose_chain_tool
+    try:
+        remove_lattice(mesh_obj)
+    except Exception as e:
+        print(f"Pose Chain Tool: failed to remove lattice: {e}")
     arm_obj = props.armature_obj
     if arm_obj and arm_obj.name in bpy.data.objects:
         try:
@@ -1767,6 +1976,11 @@ class PCT_OT_apply_deform(Operator):
     def execute(self, context):
         obj, props = get_props(context)
         mod_name = props.modifier_name
+        # In Smooth (Lattice) mode the Armature modifier is switched off and
+        # the Lattice modifier is what actually deforms the mesh.
+        lat_mod = obj.modifiers.get(LATTICE_MOD_NAME)
+        if lat_mod is not None and lat_mod.show_viewport:
+            mod_name = lat_mod.name
 
         try:
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -1906,6 +2120,9 @@ class PCT_PT_panel(Panel):
             layout.prop(props, "joint_blend")
             layout.prop(props, "auto_thickness")
             layout.prop(props, "preserve_volume")
+            layout.prop(props, "deform_mode", text="Bend")
+            if props.deform_mode == 'LATTICE':
+                layout.prop(props, "lattice_resolution")
             layout.operator("pct.activate", icon='PLAY', text="Activate")
 
         elif props.state == 'PLACING':
@@ -1931,6 +2148,12 @@ class PCT_PT_panel(Panel):
             col.prop(props, "joint_blend")
             col.prop(props, "auto_thickness")
             col.prop(props, "preserve_volume")
+            col.prop(props, "deform_mode", text="Bend")
+            if props.deform_mode == 'LATTICE':
+                col.prop(props, "lattice_resolution")
+                if not props.fast_drag:
+                    col.label(text="Turn on Fast Dragging: Smooth bends", icon='ERROR')
+                    col.label(text="drag very slowly in Sculpt Mode.")
 
             layout.separator()
             col = layout.column(align=True)

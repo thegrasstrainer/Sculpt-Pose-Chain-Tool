@@ -1,7 +1,7 @@
 # Sculpt-Pose-Chain-Tool
 A pose chain tool for Blender's sculpt mode so users can pose their meshes without leaving sculpt mode, or having to fight with the default pose brush.
 
-**Current version: 1.5.2** · Requires Blender 4.3 or newer
+**Current version: 1.6.1** · Requires Blender 4.3 or newer
 
 # Pose-able FK Chain in Sculpt Mode
 Do you ever wish that Blender's default Pose Brush tool had a bit more functionality to make posing your characters and creatures a better experience? Me too! With this N-Panel add-on you can place up to 17 points to deform your mesh without leaving Sculpt Mode!
@@ -37,7 +37,18 @@ These are available before you activate, and they update the mesh live while a c
 
 - **Weight Falloff**: how wide each bone's influence reaches. Raise it for thicker limbs; lower it if a bone is pulling on a neighboring area.
 - **Falloff Softness**: how gradually weight fades near joints and bone tips. Low values can leave dead zones; higher values smooth things out.
-- **Joint Blend**: how much each bone shares weight with its parent and children. 0 keeps every section fully independent; 1 blends joints smoothly.
+- **Joint Blend**: how wide the smooth bend is at each joint. 0 is a hard crease; 1 blends across about half of the shorter bone.
+- **Fit Limb Thickness**: measures how thick the mesh is around each bone so thick limbs move as a whole instead of tearing. Turn it off if a bone grabs a nearby part of the body.
+- **Preserve Volume**: keeps bent joints from pinching or collapsing.
+
+## Bend Style
+Choose how the mesh bends, before activating or live while a chain is active:
+
+- **Sharp (Bones)**: each section follows its own bone directly, for crisp joints.
+- **Smooth (Lattice)**: the bones bend a lattice cage around the posed area and the mesh follows it, for softer, rounder bends with far less stretching at joints. Parts that sit closer together than a lattice cell (fingers, an arm against the body) can pull on each other a little; raise **Lattice Detail** to keep them apart.
+
+## Fast Dragging
+On by default. While you drag a point, the add-on switches to Object Mode, where Blender updates the mesh many times faster, and returns to Sculpt Mode the moment you let go. Keep it on for dense meshes, and especially with Smooth (Lattice) bends.
 
 ## Preview Bone Influence
 While a chain is active, pick a point from the dropdown and click **Preview Bone Influence**. This switches to Weight Paint mode so you can see exactly which part of the mesh that bone moves and how strongly. Switch back to Sculpt Mode from the mode dropdown in the top-left of the viewport when you're done.
